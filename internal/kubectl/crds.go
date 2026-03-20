@@ -59,22 +59,17 @@ func GetRepositoryStatuses(ctx context.Context, kubeconfig string) ([]Repository
 				Name      string `json:"name"`
 				Namespace string `json:"namespace"`
 			} `json:"metadata"`
-			Status *struct {
-				Conditions []struct {
-					Status string `json:"status"`
-				} `json:"conditions"`
-				PipelineRunStatus []struct {
-					PipelineRunName string `json:"pipelineRunName"`
-					Status          struct {
-						Conditions []struct {
-							Reason string `json:"reason"`
-						} `json:"conditions"`
-					} `json:"status"`
-					CompletionTime *time.Time `json:"completionTime"`
-					SHA            *string    `json:"sha"`
-					EventType      *string    `json:"event_type"`
-				} `json:"pipelinerun_status"`
-			} `json:"status"`
+			PipelineRunStatus []struct {
+				PipelineRunName string `json:"pipelineRunName"`
+				Status          struct {
+					Conditions []struct {
+						Reason string `json:"reason"`
+					} `json:"conditions"`
+				} `json:"status"`
+				CompletionTime *time.Time `json:"completionTime"`
+				SHA            *string    `json:"sha"`
+				EventType      *string    `json:"event_type"`
+			} `json:"pipelinerun_status"`
 		} `json:"items"`
 	}
 	if err := json.Unmarshal(out, &repoList); err != nil {
@@ -88,27 +83,25 @@ func GetRepositoryStatuses(ctx context.Context, kubeconfig string) ([]Repository
 			Name:      item.Metadata.Name,
 		}
 
-		if item.Status != nil {
-			for _, pr := range item.Status.PipelineRunStatus {
-				info := PipelineRunInfo{
-					Name: pr.PipelineRunName,
-				}
-				if len(pr.Status.Conditions) > 0 {
-					info.Status = pr.Status.Conditions[0].Reason
-				}
-				if pr.EventType != nil {
-					info.EventType = *pr.EventType
-				}
-				if pr.SHA != nil && len(*pr.SHA) >= 7 {
-					info.SHA = (*pr.SHA)[:7]
-				} else if pr.SHA != nil {
-					info.SHA = *pr.SHA
-				}
-				if pr.CompletionTime != nil {
-					info.Completed = *pr.CompletionTime
-				}
-				repo.PipelineRuns = append(repo.PipelineRuns, info)
+		for _, pr := range item.PipelineRunStatus {
+			info := PipelineRunInfo{
+				Name: pr.PipelineRunName,
 			}
+			if len(pr.Status.Conditions) > 0 {
+				info.Status = pr.Status.Conditions[0].Reason
+			}
+			if pr.EventType != nil {
+				info.EventType = *pr.EventType
+			}
+			if pr.SHA != nil && len(*pr.SHA) >= 7 {
+				info.SHA = (*pr.SHA)[:7]
+			} else if pr.SHA != nil {
+				info.SHA = *pr.SHA
+			}
+			if pr.CompletionTime != nil {
+				info.Completed = *pr.CompletionTime
+			}
+			repo.PipelineRuns = append(repo.PipelineRuns, info)
 		}
 		repos = append(repos, repo)
 	}
