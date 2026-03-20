@@ -12,5 +12,8 @@ repos:
     rev: v2.1.6
     hooks:
       - id: golangci-lint
-        args: ["run", "./..."]
+        name: golangci
+        entry: golangci-lint run --fix ./...
+        language: system
         pass_filenames: false
+        types: [go]

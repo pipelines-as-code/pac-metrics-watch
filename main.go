@@ -17,7 +17,8 @@ import (
 	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
-	"github.com/charmbracelet/lipgloss"
+	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/ui/components"
+	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/ui/theme"
 )
 
 const (
@@ -44,21 +45,7 @@ const (
 	viewRaw       viewMode = "raw"
 )
 
-var (
-	styleHeader      = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("33"))
-	styleSection     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("69"))
-	styleSep         = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	styleIncr        = lipgloss.NewStyle().Foreground(lipgloss.Color("82"))
-	styleDim         = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
-	styleNormal      = lipgloss.NewStyle()
-	styleKey         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("39"))
-	styleScope       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("214"))
-	styleError       = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	styleDetail      = lipgloss.NewStyle().Foreground(lipgloss.Color("111"))
-	styleCard        = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("240")).Padding(0, 1)
-	styleCardTitle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("45"))
-	styleUnavailable = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-)
+
 
 type scrapeFunc func(ctx context.Context, kubeconfig, svcPath string) (map[string]float64, error)
 
@@ -610,14 +597,14 @@ func renderSnapshot(scope string, collectedAt time.Time, metrics map[string]floa
 
 	dashboardRows := signalRowsFromMetrics(metrics)
 	tabWriter := tabwriter.NewWriter(&builder, 0, 4, 2, ' ', 0)
-	fmt.Fprintf(tabWriter, "scope:\t%s\n", scope)
-	fmt.Fprintf(tabWriter, "timestamp:\t%s\n", collectedAt.Format(time.RFC3339))
-	tabWriter.Flush()
+	_, _ = fmt.Fprintf(tabWriter, "scope:\t%s\n", scope)
+	_, _ = fmt.Fprintf(tabWriter, "timestamp:\t%s\n", collectedAt.Format(time.RFC3339))
+	_ = tabWriter.Flush()
 	builder.WriteString("\n")
 
 	lastGroup := ""
 	tabWriter = tabwriter.NewWriter(&builder, 0, 4, 2, ' ', 0)
-	fmt.Fprintln(tabWriter, "GROUP\tSIGNAL\tVALUE\tWHY IT MATTERS")
+	_, _ = fmt.Fprintln(tabWriter, "GROUP\tSIGNAL\tVALUE\tWHY IT MATTERS")
 	for _, row := range dashboardRows {
 		if row.Group != lastGroup {
 			lastGroup = row.Group
@@ -626,9 +613,9 @@ func renderSnapshot(scope string, collectedAt time.Time, metrics map[string]floa
 		if row.Available {
 			value = formatMetricNumber(row.Value)
 		}
-		fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\n", row.Group, row.Signal.Title, value, row.Signal.Why)
+		_, _ = fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\n", row.Group, row.Signal.Title, value, row.Signal.Why)
 	}
-	tabWriter.Flush()
+	_ = tabWriter.Flush()
 	return builder.String()
 }
 
@@ -851,21 +838,6 @@ func (m *model) ensureCursorVisible() {
 		m.visibleStart = 0
 	}
 }
-
-func trimForWidth(value string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	runes := []rune(value)
-	if len(runes) <= width {
-		return value
-	}
-	if width <= 3 {
-		return string(runes[:width])
-	}
-	return string(runes[:width-3]) + "..."
-}
-
 func (m *model) handleFilterKey(msg tea.KeyPressMsg) {
 	switch msg.String() {
 	case "esc":
@@ -920,55 +892,30 @@ func (m *model) selectedDashboardRow() (dashboardRow, bool) {
 	return rows[m.cursor], true
 }
 
-func (m *model) summarySignals() []dashboardRow {
+func (m *model) summarySignals() []components.CardData {
 	rows := buildDashboardRows(m.history, m.delta)
 	ids := []string{"git-api-requests", "pipelineruns-created", "running-pipelineruns", "workqueue-depth"}
 	byID := make(map[string]dashboardRow, len(rows))
 	for _, row := range rows {
 		byID[row.Signal.ID] = row
 	}
-	result := make([]dashboardRow, 0, len(ids))
+	result := make([]components.CardData, 0, len(ids))
 	for _, id := range ids {
 		if row, ok := byID[id]; ok {
-			result = append(result, row)
+            trend := ""
+            if row.Available {
+                trend = sparkline(row.History)
+            }
+			result = append(result, components.CardData{
+                Title: row.Signal.Title,
+                Value: formatMetricNumber(row.Value),
+                Delta: formatDelta(row.Delta),
+                Trend: trend,
+                Available: row.Available,
+            })
 		}
 	}
 	return result
-}
-
-func renderCard(row dashboardRow) string {
-	value := "n/a"
-	delta := "n/a"
-	trend := ""
-	if row.Available {
-		value = formatMetricNumber(row.Value)
-		delta = formatDelta(row.Delta)
-		trend = sparkline(row.History)
-	}
-	content := styleCardTitle.Render(row.Signal.Title) + "\n" +
-		value + "  " + delta
-	if trend != "" {
-		content += "\n" + trend
-	}
-	return styleCard.Render(content)
-}
-
-func renderSummaryCards(rows []dashboardRow, width int) string {
-	if len(rows) == 0 {
-		return styleUnavailable.Render("No curated PAC metrics available yet.")
-	}
-
-	cards := make([]string, 0, len(rows))
-	for _, row := range rows {
-		cards = append(cards, renderCard(row))
-	}
-
-	if width < 120 && len(cards) > 2 {
-		top := lipgloss.JoinHorizontal(lipgloss.Top, cards[:2]...)
-		bottom := lipgloss.JoinHorizontal(lipgloss.Top, cards[2:]...)
-		return lipgloss.JoinVertical(lipgloss.Left, top, bottom)
-	}
-	return lipgloss.JoinHorizontal(lipgloss.Top, cards...)
 }
 
 func (m *model) Init() tea.Cmd {
@@ -1070,131 +1017,108 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) renderScopeHeader() string {
-	names := make([]string, len(m.scopes))
-	for i, scope := range m.scopes {
-		if i == m.activeScope {
-			names[i] = styleScope.Render("[" + scope.name + "]")
-		} else {
-			names[i] = styleDim.Render(scope.name)
-		}
-	}
-	return strings.Join(names, " | ")
-}
 
 func (m *model) renderDashboardRows(width int) ([]string, string) {
 	rows := buildDashboardRows(m.history, m.delta)
 	maxRows := m.maxVisibleRows()
 	m.ensureCursorVisible()
 
-	const (
-		colSignal = 25
-		colValue  = 11
-		colDelta  = 11
-		colGraph  = 14
-	)
-
-	rendered := []string{
-		fmt.Sprintf("  %-*s %*s %*s %-*s %s",
-			colSignal, "SIGNAL",
-			colValue, "VALUE",
-			colDelta, "DELTA",
-			colGraph, "TREND",
-			"WHAT TO WATCH",
-		),
+	columns := []components.Column{
+		{Title: "SIGNAL", Width: 22},
+		{Title: "VALUE", Width: 8, AlignRight: true},
+		{Title: "DELTA", Width: 6, AlignRight: true},
+		{Title: "TREND", Width: 12},
+		{Title: "WHAT TO WATCH", Width: max(20, width-52)},
 	}
 
+	var tableRows []components.TableRow
 	lastGroup := ""
+
+	// Keep track of logical row index for cursor (ignoring group headers)
+	logicalIdx := 0
+
 	for i, row := range rows {
 		if i < m.visibleStart || i >= m.visibleStart+maxRows {
 			continue
 		}
 		if row.Group != lastGroup {
-			rendered = append(rendered, styleSection.Render(row.Group+"  "+row.Description))
+			tableRows = append(tableRows, components.TableRow{
+				IsGroup:    true,
+				GroupTitle: row.Group + "  " + row.Description,
+			})
 			lastGroup = row.Group
-		}
-
-		cursor := "  "
-		if i == m.cursor {
-			cursor = "> "
 		}
 
 		value := "n/a"
 		delta := "n/a"
 		graph := ""
-		rowStyle := styleUnavailable
+		rowStyle := theme.StyleUnavailable
 		if row.Available {
 			value = formatMetricNumber(row.Value)
 			delta = formatDelta(row.Delta)
 			graph = sparkline(row.History)
 			graphRunes := []rune(graph)
-			if len(graphRunes) > colGraph {
-				graph = string(graphRunes[len(graphRunes)-colGraph:])
+			if len(graphRunes) > 12 {
+				graph = string(graphRunes[len(graphRunes)-12:])
 			}
 			if row.Delta > 0 {
-				rowStyle = styleIncr
+				rowStyle = theme.StyleIncr
 			} else {
-				rowStyle = styleNormal
+				rowStyle = theme.StyleNormal
 			}
 		}
 
-		line := fmt.Sprintf("%s%-*s %*s %*s %-*s %s",
-			cursor,
-			colSignal, trimForWidth(row.Signal.Title, colSignal),
-			colValue, value,
-			colDelta, delta,
-			colGraph, graph,
-			trimForWidth(row.Signal.Why, max(20, width-60)),
-		)
-		rendered = append(rendered, rowStyle.Render(line))
+		tableRows = append(tableRows, components.TableRow{
+			Columns: []string{row.Signal.Title, value, delta, graph, row.Signal.Why},
+			Style:   rowStyle,
+		})
+		logicalIdx++
 	}
 
-	detail := styleDim.Render("selected: <none>")
+	// Calculate correct cursor for table (accounting for group rows)
+	rendered := components.RenderTable(columns, tableRows, m.cursor - m.visibleStart)
+
+	detail := theme.StyleDim.Render("selected: <none>")
 	if row, ok := m.selectedDashboardRow(); ok {
 		sources := "<none>"
 		if len(row.Sources) > 0 {
 			sources = strings.Join(row.Sources, ", ")
 		}
-		detail = styleDetail.Render(
-			fmt.Sprintf(
-				"%s [%s] value=%s delta=%s  %s  sources: %s",
-				row.Signal.Title,
-				row.Signal.Kind,
-				func() string {
-					if !row.Available {
-						return "n/a"
-					}
-					return formatMetricNumber(row.Value)
-				}(),
-				func() string {
-					if !row.Available {
-						return "n/a"
-					}
-					return formatDelta(row.Delta)
-				}(),
-				row.Signal.Description,
-				sources,
-			),
+
+		valStr := "n/a"
+		deltaStr := "n/a"
+		if row.Available {
+			valStr = formatMetricNumber(row.Value)
+			deltaStr = formatDelta(row.Delta)
+		}
+
+		detail = components.RenderDetailPane(
+			row.Signal.Title,
+			row.Signal.Kind,
+			valStr,
+			deltaStr,
+			row.Signal.Description,
+			sources,
+			row.History,
+			width,
 		)
 	}
 
 	return rendered, detail
 }
 
-func (m *model) renderRawRows() ([]string, string) {
+func (m *model) renderRawRows(width int) ([]string, string) {
 	maxRows := m.maxVisibleRows()
 	m.ensureCursorVisible()
 
-	const (
-		colMetric = 48
-		colValue  = 12
-		colDelta  = 12
-		colGraph  = 20
-	)
-
-	rendered := []string{
-		fmt.Sprintf("  %-*s %*s %*s %-*s", colMetric, "RAW METRIC", colValue, "VALUE", colDelta, "DELTA", colGraph, "GRAPH"),
+	columns := []components.Column{
+		{Title: "RAW METRIC", Width: 48},
+		{Title: "VALUE", Width: 12, AlignRight: true},
+		{Title: "DELTA", Width: 12, AlignRight: true},
+		{Title: "GRAPH", Width: 20},
 	}
+
+	var tableRows []components.TableRow
 
 	for i, name := range m.keys {
 		if i < m.visibleStart || i >= m.visibleStart+maxRows {
@@ -1208,48 +1132,43 @@ func (m *model) renderRawRows() ([]string, string) {
 
 		graph := sparkline(hist)
 		graphRunes := []rune(graph)
-		if len(graphRunes) > colGraph {
-			graph = string(graphRunes[len(graphRunes)-colGraph:])
+		if len(graphRunes) > 20 {
+			graph = string(graphRunes[len(graphRunes)-20:])
 		}
 
-		cursor := "  "
-		if i == m.cursor {
-			cursor = "> "
+		rowStyle := theme.StyleNormal
+		if m.delta[name] > 0 {
+			rowStyle = theme.StyleIncr
 		}
-		line := fmt.Sprintf("%s%-*s %*s %*s %-s",
-			cursor,
-			colMetric, trimForWidth(name, colMetric),
-			colValue, formatMetricNumber(value),
-			colDelta, formatDelta(m.delta[name]),
-			graph,
-		)
-		switch {
-		case m.delta[name] > 0:
-			rendered = append(rendered, styleIncr.Render(line))
-		default:
-			rendered = append(rendered, styleNormal.Render(line))
-		}
+
+		tableRows = append(tableRows, components.TableRow{
+			Columns: []string{name, formatMetricNumber(value), formatDelta(m.delta[name]), graph},
+			Style:   rowStyle,
+		})
 	}
 
+	var rendered []string
 	if len(m.keys) == 0 {
 		message := "no raw metrics matched the current scope and filter"
 		if m.scraping && len(m.history) == 0 {
 			message = "scraping metrics..."
 		}
-		rendered = append(rendered, styleDim.Render(message))
+		rendered = append(rendered, theme.StyleDim.Render(message))
+	} else {
+		rendered = components.RenderTable(columns, tableRows, m.cursor - m.visibleStart)
 	}
 
-	detail := styleDim.Render("selected: <none>")
+	detail := theme.StyleDim.Render("selected: <none>")
 	if row, ok := m.selectedRawRow(); ok {
-		detail = styleDetail.Render(
-			fmt.Sprintf(
-				"%s  value=%s  delta=%s  samples=%d  canonical=%s",
-				row.Name,
-				formatMetricNumber(row.Value),
-				formatDelta(row.Delta),
-				len(row.History),
-				canonicalMetricName(row.Name),
-			),
+		detail = components.RenderDetailPane(
+			row.Name,
+			"raw",
+			formatMetricNumber(row.Value),
+			formatDelta(row.Delta),
+			fmt.Sprintf("samples=%d canonical=%s", len(row.History), canonicalMetricName(row.Name)),
+			"kubectl",
+			row.History,
+			width,
 		)
 	}
 	return rendered, detail
@@ -1268,61 +1187,44 @@ func (m *model) View() tea.View {
 		width = minimumViewportWidth
 	}
 
-	lastUpdate := "never"
-	if !m.lastUpdate.IsZero() {
-		lastUpdate = m.lastUpdate.Format("15:04:05")
-	}
-
-	status := "idle"
-	if m.scraping {
-		status = "scraping"
-	}
-
 	filterLabel := m.filter
 	if filterLabel == "" {
 		filterLabel = "<none>"
 	}
 
-	title := styleHeader.Render("PAC Metrics Dashboard") + "  " +
-		m.renderScopeHeader() + "  " +
-		styleDim.Render("view:"+string(m.viewMode)) + "  " +
-		styleDim.Render("sort:"+string(m.sortMode)) + "  " +
-		styleDim.Render("filter:"+filterLabel) + "  " +
-		styleDim.Render("last:"+lastUpdate) + "  " +
-		styleDim.Render("took:"+m.lastDuration.Round(time.Millisecond).String()) + "  " +
-		styleDim.Render("state:"+status)
+	scopeStrs := make([]string, len(m.scopes))
+	for i, s := range m.scopes {
+		scopeStrs[i] = s.name
+	}
 
-	separator := styleSep.Render(strings.Repeat("─", width))
-	summary := renderSummaryCards(m.summarySignals(), width)
+	header := components.RenderHeader(
+		"PAC Metrics Dashboard",
+		scopeStrs,
+		m.activeScope,
+		string(m.viewMode),
+		string(m.sortMode),
+		filterLabel,
+		m.lastUpdate,
+		m.lastDuration,
+		m.scraping,
+	)
+
+	separator := theme.StyleSep.Render(strings.Repeat("─", width))
+	summary := components.RenderSummaryCards(m.summarySignals(), width)
 
 	var rows []string
 	var detail string
 	if m.viewMode == viewDashboard {
 		rows, detail = m.renderDashboardRows(width)
 	} else {
-		rows, detail = m.renderRawRows()
+		rows, detail = m.renderRawRows(width)
 	}
 
-	help := styleKey.Render("[q]") + "quit  " +
-		styleKey.Render("[tab]") + "scope  " +
-		styleKey.Render("[d]") + "dashboard  " +
-		styleKey.Render("[r]") + "raw  " +
-		styleKey.Render("[f]") + "pac-only(raw)  " +
-		styleKey.Render("[s]") + "sort(raw)  " +
-		styleKey.Render("[/]") + "filter(raw)  " +
-		styleKey.Render("[↑↓/jk]") + "scroll"
+	footer := components.RenderFooter(m.err, m.filterMode, m.filterInput, width)
 
-	parts := []string{title, separator, summary, separator}
+	parts := []string{header, separator, summary, separator}
 	parts = append(parts, rows...)
-	parts = append(parts, separator, detail)
-	if m.filterMode {
-		parts = append(parts, styleDetail.Render(filterInputHelp))
-		parts = append(parts, styleDetail.Render("filter> "+m.filterInput))
-	}
-	if m.err != "" {
-		parts = append(parts, styleError.Render("error: "+m.err))
-	}
-	parts = append(parts, help)
+	parts = append(parts, separator, detail, footer)
 
 	view := tea.NewView(strings.Join(parts, "\n"))
 	view.AltScreen = true
