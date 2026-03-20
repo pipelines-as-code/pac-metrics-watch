@@ -14,9 +14,16 @@ func RenderHeader(title string, scopes []string, activeScope int, viewMode strin
 		lastUpdateStr = lastUpdate.Format("15:04:05")
 	}
 
+	// Activity indicator dot
+	statusDot := theme.StyleDotGreen.Render("●")
 	status := "idle"
 	if scraping {
+		statusDot = theme.StyleScope.Render("●")
 		status = "scraping"
+	}
+	if lastUpdate.IsZero() && !scraping {
+		statusDot = theme.StyleDotDim.Render("○")
+		status = "waiting"
 	}
 
 	scopeStrs := make([]string, len(scopes))
@@ -36,13 +43,15 @@ func RenderHeader(title string, scopes []string, activeScope int, viewMode strin
 		tabRaw = theme.StyleTabActive.Render("Raw (r)")
 	}
 
-	topLine := theme.StyleHeader.Render(title) + "  " + strings.Join(scopeStrs, " | ")
-	tabsLine := lipgloss.JoinHorizontal(lipgloss.Bottom, tabDashboard, " │ ", tabRaw)
-	infoLine := theme.StyleDim.Render("sort:"+sortMode) + "  " +
-		theme.StyleDim.Render("filter:"+filterLabel) + "  " +
-		theme.StyleDim.Render("last:"+lastUpdateStr) + "  " +
-		theme.StyleDim.Render("took:"+lastDuration.Round(time.Millisecond).String()) + "  " +
-		theme.StyleDim.Render("state:"+status)
+	pipe := theme.StylePipeSep.Render(" │ ")
+
+	topLine := theme.StyleHeader.Render(title) + "  " + strings.Join(scopeStrs, pipe)
+	tabsLine := lipgloss.JoinHorizontal(lipgloss.Bottom, tabDashboard, pipe, tabRaw)
+	infoLine := statusDot + " " + theme.StyleDim.Render(status) +
+		pipe + theme.StyleDim.Render("sort:"+sortMode) +
+		pipe + theme.StyleDim.Render("filter:"+filterLabel) +
+		pipe + theme.StyleDim.Render("last:"+lastUpdateStr) +
+		pipe + theme.StyleDim.Render("took:"+lastDuration.Round(time.Millisecond).String())
 
 	return lipgloss.JoinVertical(lipgloss.Left, topLine, tabsLine, infoLine)
 }

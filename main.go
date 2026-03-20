@@ -22,7 +22,7 @@ import (
 )
 
 const (
-	historySize          = 40
+	historySize          = 120
 	sparkChars           = "▁▂▃▄▅▆▇█"
 	defaultNamespace     = "pipelines-as-code"
 	defaultInterval      = 5 * time.Second
@@ -902,17 +902,19 @@ func (m *model) summarySignals() []components.CardData {
 	result := make([]components.CardData, 0, len(ids))
 	for _, id := range ids {
 		if row, ok := byID[id]; ok {
-            trend := ""
-            if row.Available {
-                trend = sparkline(row.History)
-            }
+			trend := ""
+			if row.Available {
+				trend = sparkline(row.History)
+			}
 			result = append(result, components.CardData{
-                Title: row.Signal.Title,
-                Value: formatMetricNumber(row.Value),
-                Delta: formatDelta(row.Delta),
-                Trend: trend,
-                Available: row.Available,
-            })
+				Title:    row.Signal.Title,
+				Value:    formatMetricNumber(row.Value),
+				Delta:    formatDelta(row.Delta),
+				Trend:    trend,
+				Available: row.Available,
+				SignalID: row.Signal.ID,
+				DeltaNum: row.Delta,
+			})
 		}
 	}
 	return result
@@ -1023,19 +1025,21 @@ func (m *model) renderDashboardRows(width int) ([]string, string) {
 	maxRows := m.maxVisibleRows()
 	m.ensureCursorVisible()
 
+	signalW := max(22, width/5)
+	valueW := max(8, width/12)
+	deltaW := max(6, width/14)
+	trendW := max(12, width/8)
+	whyW := max(20, width-signalW-valueW-deltaW-trendW-8)
 	columns := []components.Column{
-		{Title: "SIGNAL", Width: 22},
-		{Title: "VALUE", Width: 8, AlignRight: true},
-		{Title: "DELTA", Width: 6, AlignRight: true},
-		{Title: "TREND", Width: 12},
-		{Title: "WHAT TO WATCH", Width: max(20, width-52)},
+		{Title: "SIGNAL", Width: signalW},
+		{Title: "VALUE", Width: valueW, AlignRight: true},
+		{Title: "DELTA", Width: deltaW, AlignRight: true},
+		{Title: "TREND", Width: trendW},
+		{Title: "WHAT TO WATCH", Width: whyW},
 	}
 
 	var tableRows []components.TableRow
 	lastGroup := ""
-
-	// Keep track of logical row index for cursor (ignoring group headers)
-	logicalIdx := 0
 
 	for i, row := range rows {
 		if i < m.visibleStart || i >= m.visibleStart+maxRows {
@@ -1069,10 +1073,10 @@ func (m *model) renderDashboardRows(width int) ([]string, string) {
 		}
 
 		tableRows = append(tableRows, components.TableRow{
-			Columns: []string{row.Signal.Title, value, delta, graph, row.Signal.Why},
-			Style:   rowStyle,
+			Columns:    []string{row.Signal.Title, value, delta, graph, row.Signal.Why},
+			Style:      rowStyle,
+			DeltaValue: row.Delta,
 		})
-		logicalIdx++
 	}
 
 	// Calculate correct cursor for table (accounting for group rows)
@@ -1111,11 +1115,15 @@ func (m *model) renderRawRows(width int) ([]string, string) {
 	maxRows := m.maxVisibleRows()
 	m.ensureCursorVisible()
 
+	metricW := max(36, width/2)
+	valW := max(10, width/8)
+	dltW := max(10, width/8)
+	graphW := max(16, width-metricW-valW-dltW-6)
 	columns := []components.Column{
-		{Title: "RAW METRIC", Width: 48},
-		{Title: "VALUE", Width: 12, AlignRight: true},
-		{Title: "DELTA", Width: 12, AlignRight: true},
-		{Title: "GRAPH", Width: 20},
+		{Title: "RAW METRIC", Width: metricW},
+		{Title: "VALUE", Width: valW, AlignRight: true},
+		{Title: "DELTA", Width: dltW, AlignRight: true},
+		{Title: "GRAPH", Width: graphW},
 	}
 
 	var tableRows []components.TableRow
@@ -1142,8 +1150,9 @@ func (m *model) renderRawRows(width int) ([]string, string) {
 		}
 
 		tableRows = append(tableRows, components.TableRow{
-			Columns: []string{name, formatMetricNumber(value), formatDelta(m.delta[name]), graph},
-			Style:   rowStyle,
+			Columns:    []string{name, formatMetricNumber(value), formatDelta(m.delta[name]), graph},
+			Style:      rowStyle,
+			DeltaValue: m.delta[name],
 		})
 	}
 
@@ -1174,12 +1183,6 @@ func (m *model) renderRawRows(width int) ([]string, string) {
 	return rendered, detail
 }
 
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
 
 func (m *model) View() tea.View {
 	width := m.width
@@ -1210,6 +1213,7 @@ func (m *model) View() tea.View {
 	)
 
 	separator := theme.StyleSep.Render(strings.Repeat("─", width))
+	thinSep := theme.StyleSep.Render(strings.Repeat("╌", width))
 	summary := components.RenderSummaryCards(m.summarySignals(), width)
 
 	var rows []string
@@ -1222,9 +1226,9 @@ func (m *model) View() tea.View {
 
 	footer := components.RenderFooter(m.err, m.filterMode, m.filterInput, width)
 
-	parts := []string{header, separator, summary, separator}
+	parts := []string{header, separator, summary, thinSep}
 	parts = append(parts, rows...)
-	parts = append(parts, separator, detail, footer)
+	parts = append(parts, separator, detail, "", footer)
 
 	view := tea.NewView(strings.Join(parts, "\n"))
 	view.AltScreen = true

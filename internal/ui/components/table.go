@@ -18,14 +18,18 @@ type TableRow struct {
 	Columns    []string
 	Style      lipgloss.Style
 	IsGroup    bool
-	GroupTitle string
+	GroupTitle  string
+	DeltaValue float64
 }
 
 func RenderTable(columns []Column, rows []TableRow, cursor int) []string {
 	var rendered []string
 
 	headerParts := make([]string, len(columns))
-	for i, col := range columns {
+	// Leave space for the dot indicator
+	headerParts[0] = fmt.Sprintf("  %-*s", columns[0].Width, trimForWidth(columns[0].Title, columns[0].Width))
+	for i := 1; i < len(columns); i++ {
+		col := columns[i]
 		if col.AlignRight {
 			headerParts[i] = fmt.Sprintf("%*s", col.Width, trimForWidth(col.Title, col.Width))
 		} else {
@@ -35,10 +39,19 @@ func RenderTable(columns []Column, rows []TableRow, cursor int) []string {
 	headerLine := theme.StyleTableHeader.Render(strings.Join(headerParts, " "))
 	rendered = append(rendered, headerLine)
 
-	for i, row := range rows {
+	dataIdx := 0
+	for _, row := range rows {
 		if row.IsGroup {
 			rendered = append(rendered, theme.StyleSection.Render(row.GroupTitle))
 			continue
+		}
+
+		// Delta dot indicator
+		dot := theme.StyleDotDim.Render("○")
+		if row.DeltaValue > 0 {
+			dot = theme.StyleDotGreen.Render("●")
+		} else if row.DeltaValue < 0 {
+			dot = theme.StyleDotRed.Render("●")
 		}
 
 		rowParts := make([]string, len(columns))
@@ -46,9 +59,9 @@ func RenderTable(columns []Column, rows []TableRow, cursor int) []string {
 			width := columns[j].Width
 
 			if j == 0 {
-				prefix := "  "
-				if i == cursor {
-					prefix = "> "
+				prefix := dot + " "
+				if dataIdx == cursor {
+					prefix = theme.StyleIncr.Render("▸") + " "
 				}
 				text := trimForWidth(colText, width-2)
 				rowParts[j] = fmt.Sprintf("%s%-*s", prefix, width-2, text)
@@ -63,11 +76,14 @@ func RenderTable(columns []Column, rows []TableRow, cursor int) []string {
 		}
 
 		line := strings.Join(rowParts, " ")
-		if i == cursor {
+		if dataIdx == cursor {
 			rendered = append(rendered, theme.StyleTableCursor.Render(line))
+		} else if dataIdx%2 == 1 {
+			rendered = append(rendered, theme.StyleAltRow.Render(row.Style.Render(line)))
 		} else {
 			rendered = append(rendered, row.Style.Render(line))
 		}
+		dataIdx++
 	}
 
 	return rendered
