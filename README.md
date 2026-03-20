@@ -17,6 +17,12 @@ debugging PAC behavior:
 - Workqueue pressure
 - Controller-runtime reconcile health
 
+
+
+https://github.com/user-attachments/assets/0bca096f-a621-4e6b-a42b-532daf112630
+
+
+
 ## Build
 
 Build the tool with:
