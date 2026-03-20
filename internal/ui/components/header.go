@@ -14,7 +14,6 @@ func RenderHeader(title string, scopes []string, activeScope int, viewMode strin
 		lastUpdateStr = lastUpdate.Format("15:04:05")
 	}
 
-	// Activity indicator dot
 	statusDot := theme.StyleDotGreen.Render("●")
 	status := "idle"
 	if scraping {
@@ -35,18 +34,30 @@ func RenderHeader(title string, scopes []string, activeScope int, viewMode strin
 		}
 	}
 
-	tabDashboard := theme.StyleTabInactive.Render("Dashboard (d)")
-	tabRaw := theme.StyleTabInactive.Render("Raw (r)")
-	if viewMode == "dashboard" {
-		tabDashboard = theme.StyleTabActive.Render("Dashboard (d)")
-	} else {
-		tabRaw = theme.StyleTabActive.Render("Raw (r)")
+	tabs := []struct {
+		label string
+		mode  string
+	}{
+		{"Dashboard (d)", "dashboard"},
+		{"Raw (r)", "raw"},
+		{"Health (h)", "health"},
+		{"Repos (p)", "repos"},
+		{"Events (e)", "events"},
 	}
 
 	pipe := theme.StylePipeSep.Render(" │ ")
 
+	tabStrs := make([]string, len(tabs))
+	for i, tab := range tabs {
+		if viewMode == tab.mode {
+			tabStrs[i] = theme.StyleTabActive.Render(tab.label)
+		} else {
+			tabStrs[i] = theme.StyleTabInactive.Render(tab.label)
+		}
+	}
+
 	topLine := theme.StyleHeader.Render(title) + "  " + strings.Join(scopeStrs, pipe)
-	tabsLine := lipgloss.JoinHorizontal(lipgloss.Bottom, tabDashboard, pipe, tabRaw)
+	tabsLine := lipgloss.JoinHorizontal(lipgloss.Bottom, tabStrs[0], pipe, tabStrs[1], pipe, tabStrs[2], pipe, tabStrs[3], pipe, tabStrs[4])
 	infoLine := statusDot + " " + theme.StyleDim.Render(status) +
 		pipe + theme.StyleDim.Render("sort:"+sortMode) +
 		pipe + theme.StyleDim.Render("filter:"+filterLabel) +

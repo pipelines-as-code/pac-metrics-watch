@@ -39,4 +39,5 @@ var (
 	StyleCardGreen = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#98C379")).Padding(0, 1)
 	StyleCardRed   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#E06C75")).Padding(0, 1)
 	StyleSparkDim  = lipgloss.NewStyle().Foreground(lipgloss.Color("#3E4451"))
+	StyleWarn      = lipgloss.NewStyle().Foreground(lipgloss.Color("#E5C07B"))
 )

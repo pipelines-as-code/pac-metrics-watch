@@ -8,57 +8,100 @@ import (
 	"time"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/metrics"
 )
 
+func mustModel(t *testing.T, m tea.Model) *model {
+	t.Helper()
+	mm, ok := m.(*model)
+	if !ok {
+		t.Fatalf("expected *model, got %T", m)
+	}
+	return mm
+}
+
 func TestParseMetricsAggregatesMetricFamilies(t *testing.T) {
-	metrics, err := parseMetrics(`
+	m, err := metrics.ParseMetrics(`
 # HELP pac_events_total Number of PAC events
 pac_events_total{provider="github"} 2
 pac_events_total{provider="gitlab"} 3
 workqueue_depth{name="foo"} 4
 `)
 	if err != nil {
-		t.Fatalf("parseMetrics returned error: %v", err)
+		t.Fatalf("ParseMetrics returned error: %v", err)
 	}
 
-	if got, want := metrics["pac_events_total"], 5.0; got != want {
+	if got, want := m["pac_events_total"], 5.0; got != want {
 		t.Fatalf("pac_events_total = %v, want %v", got, want)
 	}
-	if got, want := metrics["workqueue_depth"], 4.0; got != want {
+	if got, want := m["workqueue_depth"], 4.0; got != want {
 		t.Fatalf("workqueue_depth = %v, want %v", got, want)
 	}
 }
 
+func TestParseWithLabelsPreservesLabels(t *testing.T) {
+	families, err := metrics.ParseWithLabels(`
+pac_events_total{provider="github"} 2
+pac_events_total{provider="gitlab"} 3
+workqueue_depth{name="foo"} 4
+`)
+	if err != nil {
+		t.Fatalf("ParseWithLabels returned error: %v", err)
+	}
+
+	family, ok := families["pac_events_total"]
+	if !ok {
+		t.Fatal("pac_events_total family not found")
+	}
+	if got, want := len(family.Samples), 2; got != want {
+		t.Fatalf("len(samples) = %d, want %d", got, want)
+	}
+	if got, want := family.Total, 5.0; got != want {
+		t.Fatalf("total = %v, want %v", got, want)
+	}
+
+	// Check that labels are preserved
+	foundGithub := false
+	for _, s := range family.Samples {
+		if s.Labels["provider"] == "github" && s.Value == 2 {
+			foundGithub = true
+		}
+	}
+	if !foundGithub {
+		t.Fatal("github provider sample not found")
+	}
+}
+
 func TestBuildEndpointsUsesMetricsPort(t *testing.T) {
-	endpoints := buildEndpoints(defaultNamespace)
+	endpoints := metrics.BuildEndpoints(defaultNamespace)
 	if len(endpoints) != 2 {
 		t.Fatalf("len(endpoints) = %d, want 2", len(endpoints))
 	}
 
-	if got := endpoints[0].svcPath; got != "/api/v1/namespaces/pipelines-as-code/services/pipelines-as-code-controller:9090/proxy/metrics" {
+	if got := endpoints[0].SvcPath; got != "/api/v1/namespaces/pipelines-as-code/services/pipelines-as-code-controller:9090/proxy/metrics" {
 		t.Fatalf("controller svcPath = %q", got)
 	}
-	if got := endpoints[1].svcPath; got != "/api/v1/namespaces/pipelines-as-code/services/pipelines-as-code-watcher:9090/proxy/metrics" {
+	if got := endpoints[1].SvcPath; got != "/api/v1/namespaces/pipelines-as-code/services/pipelines-as-code-watcher:9090/proxy/metrics" {
 		t.Fatalf("watcher svcPath = %q", got)
 	}
 }
 
 func TestBuildScopes(t *testing.T) {
-	scopes := buildScopes(buildEndpoints(defaultNamespace))
-	if got := scopes[0].name; got != "all" {
-		t.Fatalf("scopes[0].name = %q, want all", got)
+	scopes := metrics.BuildScopes(metrics.BuildEndpoints(defaultNamespace))
+	if got := scopes[0].Name; got != "all" {
+		t.Fatalf("scopes[0].Name = %q, want all", got)
 	}
-	if len(scopes[0].endpointIndexes) != 2 {
-		t.Fatalf("len(scopes[0].endpointIndexes) = %d, want 2", len(scopes[0].endpointIndexes))
+	if len(scopes[0].EndpointIndexes) != 2 {
+		t.Fatalf("len(scopes[0].EndpointIndexes) = %d, want 2", len(scopes[0].EndpointIndexes))
 	}
 }
 
 func TestCanonicalMetricName(t *testing.T) {
-	if got := canonicalMetricName("pac_controller_pipelines_as_code_git_provider_api_request_count"); got != "pipelines_as_code_git_provider_api_request_count" {
-		t.Fatalf("canonicalMetricName(controller) = %q", got)
+	if got := metrics.CanonicalMetricName("pac_controller_pipelines_as_code_git_provider_api_request_count"); got != "pipelines_as_code_git_provider_api_request_count" {
+		t.Fatalf("CanonicalMetricName(controller) = %q", got)
 	}
-	if got := canonicalMetricName("pac_watcher_workqueue_depth"); got != "workqueue_depth" {
-		t.Fatalf("canonicalMetricName(watcher) = %q", got)
+	if got := metrics.CanonicalMetricName("pac_watcher_workqueue_depth"); got != "workqueue_depth" {
+		t.Fatalf("CanonicalMetricName(watcher) = %q", got)
 	}
 }
 
@@ -74,8 +117,8 @@ func TestBuildDashboardRowsCombinesControllerAndWatcherSignals(t *testing.T) {
 		"pac_watcher_pipelines_as_code_running_pipelineruns_count":        2,
 	}
 
-	rows := buildDashboardRows(history, delta)
-	var apiRow dashboardRow
+	rows := metrics.BuildDashboardRows(history, delta)
+	var apiRow metrics.DashboardRow
 	found := false
 	for _, row := range rows {
 		if row.Signal.ID == "git-api-requests" {
@@ -100,8 +143,8 @@ func TestBuildDashboardRowsCombinesControllerAndWatcherSignals(t *testing.T) {
 
 func TestParseMetricsScannerError(t *testing.T) {
 	line := strings.Repeat("a", 70*1024) + " 1\n"
-	if _, err := parseMetrics(line); err == nil {
-		t.Fatal("parseMetrics returned nil error for oversized token")
+	if _, err := metrics.ParseMetrics(line); err == nil {
+		t.Fatal("ParseMetrics returned nil error for oversized token")
 	}
 }
 
@@ -117,7 +160,7 @@ func TestBuildRowsFromHistoryRespectsFilterAndSort(t *testing.T) {
 		"controller_runtime_errors": 0,
 	}
 
-	rows := buildRowsFromHistory(history, delta, false, "queue", sortByDelta)
+	rows := metrics.BuildRowsFromHistory(history, delta, false, "queue", metrics.SortByDelta)
 	if len(rows) != 1 {
 		t.Fatalf("len(rows) = %d, want 1", len(rows))
 	}
@@ -125,14 +168,14 @@ func TestBuildRowsFromHistoryRespectsFilterAndSort(t *testing.T) {
 		t.Fatalf("rows[0].Name = %q, want workqueue_queue_duration", rows[0].Name)
 	}
 
-	rows = buildRowsFromHistory(history, delta, false, "", sortByDelta)
+	rows = metrics.BuildRowsFromHistory(history, delta, false, "", metrics.SortByDelta)
 	if rows[0].Name != "pac_active_repositories" {
 		t.Fatalf("rows sorted by delta = %q, want pac_active_repositories", rows[0].Name)
 	}
 }
 
 func TestModelInitStartsImmediateScrape(t *testing.T) {
-	m := initialModel("", defaultNamespace, time.Second, false, 0, sortByDelta, "", func(ctx context.Context, kubeconfig, svcPath string) (map[string]float64, error) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", func(ctx context.Context, kubeconfig, svcPath string) (map[string]float64, error) {
 		return map[string]float64{"pac_controller_pipelines_as_code_pipelinerun_count": 7}, nil
 	})
 
@@ -155,7 +198,7 @@ func TestModelInitStartsImmediateScrape(t *testing.T) {
 }
 
 func TestTickIgnoredWhileScraping(t *testing.T) {
-	m := initialModel("", defaultNamespace, time.Second, false, 0, sortByDelta, "", nil)
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
 	m.scraping = true
 	m.scrapeSeq = 9
 
@@ -163,14 +206,14 @@ func TestTickIgnoredWhileScraping(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("tick during active scrape returned a command")
 	}
-	updated := nextModel.(*model)
+	updated := mustModel(t, nextModel)
 	if updated.scrapeSeq != 9 {
 		t.Fatalf("scrapeSeq = %d, want 9", updated.scrapeSeq)
 	}
 }
 
 func TestScrapeResultSchedulesNextTickAndUpdatesMetrics(t *testing.T) {
-	m := initialModel("", defaultNamespace, time.Second, false, 0, sortByDelta, "", nil)
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
 	m.scraping = true
 	m.scrapeSeq = 1
 
@@ -185,7 +228,7 @@ func TestScrapeResultSchedulesNextTickAndUpdatesMetrics(t *testing.T) {
 		t.Fatal("scrape result did not schedule next tick")
 	}
 
-	updated := nextModel.(*model)
+	updated := mustModel(t, nextModel)
 	if updated.scraping {
 		t.Fatal("model.scraping = true, want false after scrape result")
 	}
@@ -199,7 +242,7 @@ func TestScrapeResultSchedulesNextTickAndUpdatesMetrics(t *testing.T) {
 
 func TestSwitchScopeResetsStateAndCancelsScrape(t *testing.T) {
 	canceled := false
-	m := initialModel("", defaultNamespace, time.Second, false, 0, sortByDelta, "", func(ctx context.Context, kubeconfig, svcPath string) (map[string]float64, error) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", func(ctx context.Context, kubeconfig, svcPath string) (map[string]float64, error) {
 		return map[string]float64{"pac_controller_pipelines_as_code_pipelinerun_count": 1}, nil
 	})
 	m.scraping = true
@@ -217,7 +260,7 @@ func TestSwitchScopeResetsStateAndCancelsScrape(t *testing.T) {
 		t.Fatal("switch scope did not trigger immediate scrape")
 	}
 
-	updated := nextModel.(*model)
+	updated := mustModel(t, nextModel)
 	if !canceled {
 		t.Fatal("active scrape was not canceled")
 	}
@@ -236,7 +279,7 @@ func TestSwitchScopeResetsStateAndCancelsScrape(t *testing.T) {
 }
 
 func TestCanceledScrapeResultIsIgnored(t *testing.T) {
-	m := initialModel("", defaultNamespace, time.Second, false, 0, sortByDelta, "", nil)
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
 	m.scraping = true
 	m.scrapeSeq = 2
 
@@ -249,7 +292,7 @@ func TestCanceledScrapeResultIsIgnored(t *testing.T) {
 	if cmd != nil {
 		t.Fatal("canceled scrape should not schedule next tick")
 	}
-	updated := nextModel.(*model)
+	updated := mustModel(t, nextModel)
 	if updated.err != "" {
 		t.Fatalf("err = %q, want empty", updated.err)
 	}
@@ -272,11 +315,11 @@ func TestRenderSnapshotTSV(t *testing.T) {
 }
 
 func TestRunSnapshotIncludesScrapeErrorText(t *testing.T) {
-	_, err := runSnapshot(snapshotConfig{
-		namespace: defaultNamespace,
-		scope:     "controller",
-		output:    "table",
-		sortMode:  sortByAlpha,
+	_, err := runSnapshot(metrics.SnapshotConfig{
+		Namespace: defaultNamespace,
+		Scope:     "controller",
+		Output:    "table",
+		SortMode:  metrics.SortByAlpha,
 	}, func(ctx context.Context, kubeconfig, svcPath string) (map[string]float64, error) {
 		return nil, errors.New("forbidden: services/proxy is not allowed")
 	})
@@ -286,5 +329,185 @@ func TestRunSnapshotIncludesScrapeErrorText(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "forbidden") {
 		t.Fatalf("error = %q, want forbidden details", err)
+	}
+}
+
+func TestHealthViewSwitch(t *testing.T) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
+	nextModel, cmd := m.Update(tea.KeyPressMsg{Code: -1, Text: "h"})
+	updated := mustModel(t, nextModel)
+	if updated.viewMode != metrics.ViewHealth {
+		t.Fatalf("viewMode = %q, want health", updated.viewMode)
+	}
+	if !updated.healthLoading {
+		t.Fatal("healthLoading = false, want true")
+	}
+	if cmd == nil {
+		t.Fatal("switching to health view should trigger health checks")
+	}
+}
+
+func TestReposViewSwitch(t *testing.T) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
+	nextModel, cmd := m.Update(tea.KeyPressMsg{Code: -1, Text: "p"})
+	updated := mustModel(t, nextModel)
+	if updated.viewMode != metrics.ViewRepos {
+		t.Fatalf("viewMode = %q, want repos", updated.viewMode)
+	}
+	if !updated.reposLoading {
+		t.Fatal("reposLoading = false, want true")
+	}
+	if cmd == nil {
+		t.Fatal("switching to repos view should trigger fetch")
+	}
+}
+
+func TestEventsViewSwitch(t *testing.T) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
+	nextModel, cmd := m.Update(tea.KeyPressMsg{Code: -1, Text: "e"})
+	updated := mustModel(t, nextModel)
+	if updated.viewMode != metrics.ViewEvents {
+		t.Fatalf("viewMode = %q, want events", updated.viewMode)
+	}
+	if !updated.eventsLoading {
+		t.Fatal("eventsLoading = false, want true")
+	}
+	if cmd == nil {
+		t.Fatal("switching to events view should trigger fetch")
+	}
+}
+
+func TestRenderRawSnapshotTable(t *testing.T) {
+	output := renderRawSnapshot("all", time.Unix(0, 0).UTC(), map[string]float64{
+		"pac_controller_pipelines_as_code_pipelinerun_count": 5,
+		"process_start_time_seconds":                         1000,
+	}, metrics.SnapshotConfig{
+		PacOnly:  true,
+		SortMode: metrics.SortByAlpha,
+		Output:   "table",
+	})
+
+	if !strings.Contains(output, "view:") || !strings.Contains(output, "raw") {
+		t.Fatalf("output missing view metadata: %q", output)
+	}
+	if !strings.Contains(output, "METRIC") || !strings.Contains(output, "VALUE") {
+		t.Fatalf("output missing table header: %q", output)
+	}
+	if !strings.Contains(output, "pac_controller_pipelines_as_code_pipelinerun_count") {
+		t.Fatalf("output missing PAC metric: %q", output)
+	}
+	// pac-only should filter out non-PAC metrics
+	if strings.Contains(output, "process_start_time_seconds") {
+		t.Fatalf("output should not contain non-PAC metric with pac-only: %q", output)
+	}
+}
+
+func TestRenderRawSnapshotTSV(t *testing.T) {
+	output := renderRawSnapshot("controller", time.Unix(0, 0).UTC(), map[string]float64{
+		"pac_controller_pipelines_as_code_pipelinerun_count": 3,
+	}, metrics.SnapshotConfig{
+		SortMode: metrics.SortByAlpha,
+		Output:   "tsv",
+	})
+
+	if !strings.Contains(output, "# scope=controller view=raw") {
+		t.Fatalf("output missing scope/view metadata: %q", output)
+	}
+	if !strings.Contains(output, "metric\tvalue") {
+		t.Fatalf("output missing header: %q", output)
+	}
+	if !strings.Contains(output, "pac_controller_pipelines_as_code_pipelinerun_count\t3") {
+		t.Fatalf("output missing metric row: %q", output)
+	}
+}
+
+func TestRenderRawSnapshotFilter(t *testing.T) {
+	output := renderRawSnapshot("all", time.Unix(0, 0).UTC(), map[string]float64{
+		"pac_controller_pipelines_as_code_pipelinerun_count":    5,
+		"pac_controller_pipelines_as_code_git_provider_api_req": 10,
+	}, metrics.SnapshotConfig{
+		Filter:   "pipelinerun",
+		SortMode: metrics.SortByAlpha,
+		Output:   "table",
+	})
+
+	if !strings.Contains(output, "pipelinerun_count") {
+		t.Fatalf("output missing filtered metric: %q", output)
+	}
+	if strings.Contains(output, "git_provider_api_req") {
+		t.Fatalf("output should not contain filtered-out metric: %q", output)
+	}
+}
+
+func TestRepoFetchErrorPropagation(t *testing.T) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
+	nextModel, _ := m.Update(repoStatusResultMsg{
+		err: errors.New("forbidden: cannot list repositories"),
+	})
+	updated := mustModel(t, nextModel)
+	if updated.reposErr == "" {
+		t.Fatal("reposErr should be set when fetch fails")
+	}
+	if !strings.Contains(updated.reposErr, "forbidden") {
+		t.Fatalf("reposErr = %q, want to contain 'forbidden'", updated.reposErr)
+	}
+	if updated.reposLoading {
+		t.Fatal("reposLoading should be false after result")
+	}
+}
+
+func TestRepoFetchSuccessClearsError(t *testing.T) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
+	m.reposErr = "previous error"
+	nextModel, _ := m.Update(repoStatusResultMsg{})
+	updated := mustModel(t, nextModel)
+	if updated.reposErr != "" {
+		t.Fatalf("reposErr = %q, want empty after successful fetch", updated.reposErr)
+	}
+}
+
+func TestEventFetchErrorPropagation(t *testing.T) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
+	nextModel, _ := m.Update(eventsResultMsg{
+		err: errors.New("namespace not found"),
+	})
+	updated := mustModel(t, nextModel)
+	if updated.eventsErr == "" {
+		t.Fatal("eventsErr should be set when fetch fails")
+	}
+	if !strings.Contains(updated.eventsErr, "namespace not found") {
+		t.Fatalf("eventsErr = %q, want to contain 'namespace not found'", updated.eventsErr)
+	}
+	if updated.eventsLoading {
+		t.Fatal("eventsLoading should be false after result")
+	}
+}
+
+func TestEventFetchSuccessClearsError(t *testing.T) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
+	m.eventsErr = "previous error"
+	nextModel, _ := m.Update(eventsResultMsg{})
+	updated := mustModel(t, nextModel)
+	if updated.eventsErr != "" {
+		t.Fatalf("eventsErr = %q, want empty after successful fetch", updated.eventsErr)
+	}
+}
+
+func TestLabelToggle(t *testing.T) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
+	m.viewMode = metrics.ViewDashboard
+
+	// Press enter to toggle labels
+	nextModel, _ := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	updated := mustModel(t, nextModel)
+	if !updated.showLabels {
+		t.Fatal("showLabels = false, want true after enter")
+	}
+
+	// Press esc to dismiss
+	nextModel, _ = updated.Update(tea.KeyPressMsg{Code: tea.KeyEscape})
+	updated = mustModel(t, nextModel)
+	if updated.showLabels {
+		t.Fatal("showLabels = true, want false after esc")
 	}
 }

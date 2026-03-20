@@ -1,116 +1,56 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
-	"math"
 	"os"
-	"os/exec"
-	"sort"
-	"strconv"
 	"strings"
 	"text/tabwriter"
 	"time"
 	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/kubectl"
+	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/metrics"
 	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/ui/components"
 	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/ui/theme"
+	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/ui/views"
 )
 
 const (
 	historySize          = 120
-	sparkChars           = "▁▂▃▄▅▆▇█"
 	defaultNamespace     = "pipelines-as-code"
 	defaultInterval      = 5 * time.Second
 	defaultSnapshotMode  = "table"
-	filterInputHelp      = "filter: type to narrow raw metrics, enter to keep, esc to clear"
 	minimumViewportWidth = 96
 )
 
-type sortMode string
-
-const (
-	sortByDelta sortMode = "delta"
-	sortByAlpha sortMode = "alpha"
-)
-
-type viewMode string
-
-const (
-	viewDashboard viewMode = "dashboard"
-	viewRaw       viewMode = "raw"
-)
-
-
-
-type scrapeFunc func(ctx context.Context, kubeconfig, svcPath string) (map[string]float64, error)
-
+// Message types for async operations.
 type scrapeCycleResultMsg struct {
 	id       int
 	scope    int
 	metrics  map[string]float64
+	rawData  map[string]string // endpoint name -> raw metrics text
 	err      error
 	duration time.Duration
 }
 
 type tickMsg time.Time
 
-type endpointDef struct {
-	name    string
-	svcPath string
+type healthCheckResultMsg struct {
+	checks []views.HealthCheck
 }
 
-type scopeDef struct {
-	name            string
-	endpointIndexes []int
+type repoStatusResultMsg struct {
+	repos []kubectl.RepositoryStatus
+	err   error
 }
 
-type metricRow struct {
-	Name    string
-	Value   float64
-	Delta   float64
-	History []float64
-}
-
-type signalDefinition struct {
-	ID          string
-	Title       string
-	Kind        string
-	Exact       []string
-	Prefixes    []string
-	Description string
-	Why         string
-}
-
-type dashboardGroup struct {
-	Title       string
-	Description string
-	Signals     []signalDefinition
-}
-
-type dashboardRow struct {
-	Group       string
-	Description string
-	Signal      signalDefinition
-	Value       float64
-	Delta       float64
-	History     []float64
-	Sources     []string
-	Available   bool
-}
-
-type snapshotConfig struct {
-	kubeconfig string
-	namespace  string
-	scope      string
-	pacOnly    bool
-	filter     string
-	sortMode   sortMode
-	output     string
+type eventsResultMsg struct {
+	events []kubectl.K8sEvent
+	err    error
 }
 
 type model struct {
@@ -118,9 +58,9 @@ type model struct {
 	namespace  string
 	interval   time.Duration
 	pacOnly    bool
-	endpoints  []endpointDef
-	scopes     []scopeDef
-	scraper    scrapeFunc
+	endpoints  []metrics.EndpointDef
+	scopes     []metrics.ScopeDef
+	scraper    metrics.ScrapeFunc
 
 	activeScope  int
 	history      map[string][]float64
@@ -136,518 +76,33 @@ type model struct {
 	scraping     bool
 	scrapeSeq    int
 	cancelScrape context.CancelFunc
-	sortMode     sortMode
+	sortMode     metrics.SortMode
 	filter       string
 	filterInput  string
 	filterMode   bool
-	viewMode     viewMode
+	viewMode     metrics.ViewMode
+
+	// Label breakdown state
+	labeledSnapshot map[string]*metrics.MetricFamily
+	showLabels      bool
+
+	// Health check state
+	healthChecks  []views.HealthCheck
+	healthLoading bool
+
+	// Repository status state
+	repoStatuses []kubectl.RepositoryStatus
+	reposLoading bool
+	reposErr     string
+
+	// Events state
+	events        []kubectl.K8sEvent
+	eventsLoading bool
+	eventsErr     string
 }
 
-var dashboardGroups = []dashboardGroup{
-	{
-		Title:       "PAC Flow",
-		Description: "Core business signals for webhook traffic and PipelineRun activity.",
-		Signals: []signalDefinition{
-			{
-				ID:          "git-api-requests",
-				Title:       "Git Provider API Requests",
-				Kind:        "counter",
-				Exact:       []string{"pipelines_as_code_git_provider_api_request_count"},
-				Description: "Total API calls made by PAC to Git providers.",
-				Why:         "Watch the delta for spikes caused by webhook bursts, retries, or inefficient polling.",
-			},
-			{
-				ID:          "pipelineruns-created",
-				Title:       "PipelineRuns Created",
-				Kind:        "counter",
-				Exact:       []string{"pipelines_as_code_pipelinerun_count"},
-				Description: "PipelineRuns created by PAC.",
-				Why:         "This is the clearest signal that PAC is accepting events and launching work.",
-			},
-			{
-				ID:          "running-pipelineruns",
-				Title:       "Running PipelineRuns",
-				Kind:        "gauge",
-				Exact:       []string{"pipelines_as_code_running_pipelineruns_count"},
-				Description: "Current number of in-flight PipelineRuns.",
-				Why:         "A sustained high value points to backlog, long-running builds, or stuck executions.",
-			},
-			{
-				ID:          "pipelinerun-duration",
-				Title:       "PipelineRun Duration Seconds",
-				Kind:        "counter",
-				Exact:       []string{"pipelines_as_code_pipelinerun_duration_seconds_sum"},
-				Description: "Cumulative seconds spent by PAC-created PipelineRuns.",
-				Why:         "The delta approximates how much run-time accumulated during the last refresh window.",
-			},
-		},
-	},
-	{
-		Title:       "Queue Health",
-		Description: "Controller queue behavior that usually explains why PAC feels slow or bursty.",
-		Signals: []signalDefinition{
-			{
-				ID:          "workqueue-depth",
-				Title:       "Workqueue Depth",
-				Kind:        "gauge",
-				Exact:       []string{"workqueue_depth"},
-				Description: "Items waiting in controller workqueues.",
-				Why:         "Depth above zero means the controller is lagging behind incoming work.",
-			},
-			{
-				ID:          "workqueue-adds",
-				Title:       "Workqueue Adds",
-				Kind:        "counter",
-				Exact:       []string{"workqueue_adds_total"},
-				Description: "New items added to controller workqueues.",
-				Why:         "A fast-growing delta means PAC is being fed work quickly, often from webhook traffic.",
-			},
-			{
-				ID:          "workqueue-retries",
-				Title:       "Workqueue Retries",
-				Kind:        "counter",
-				Exact:       []string{"workqueue_retries_total"},
-				Description: "Retries issued by controller workqueues.",
-				Why:         "Any sustained retry growth deserves investigation because reconciles are failing or being requeued.",
-			},
-			{
-				ID:          "workqueue-queue-seconds",
-				Title:       "Queue Wait Seconds",
-				Kind:        "counter",
-				Exact:       []string{"workqueue_queue_duration_seconds_sum"},
-				Description: "Cumulative time spent waiting in the queue.",
-				Why:         "If this delta rises faster than work throughput, PAC is falling behind.",
-			},
-		},
-	},
-	{
-		Title:       "Reconcile Health",
-		Description: "Signals from controller-runtime that help explain controller behavior.",
-		Signals: []signalDefinition{
-			{
-				ID:          "reconcile-total",
-				Title:       "Reconciles",
-				Kind:        "counter",
-				Exact:       []string{"controller_runtime_reconcile_total"},
-				Description: "Total reconcile executions.",
-				Why:         "Use the delta to see how active the reconciler is during webhook or status-reporting bursts.",
-			},
-			{
-				ID:          "reconcile-errors",
-				Title:       "Reconcile Errors",
-				Kind:        "counter",
-				Exact:       []string{"controller_runtime_reconcile_errors_total"},
-				Description: "Reconcile executions that ended in error.",
-				Why:         "This should stay near zero. Growth here often lines up with user-visible PAC failures.",
-			},
-			{
-				ID:          "active-workers",
-				Title:       "Active Workers",
-				Kind:        "gauge",
-				Exact:       []string{"controller_runtime_active_workers"},
-				Description: "Current active reconcile workers.",
-				Why:         "A low worker count with growing queue depth means the controller is under-provisioned or blocked.",
-			},
-			{
-				ID:          "workqueue-work-seconds",
-				Title:       "Work Seconds",
-				Kind:        "counter",
-				Exact:       []string{"workqueue_work_duration_seconds_sum"},
-				Description: "Cumulative active work duration in queues.",
-				Why:         "This helps distinguish time spent processing from time spent merely waiting in the queue.",
-			},
-		},
-	},
-}
-
-func buildEndpoints(namespace string) []endpointDef {
-	base := fmt.Sprintf("/api/v1/namespaces/%s/services", namespace)
-	return []endpointDef{
-		{name: "controller", svcPath: fmt.Sprintf("%s/pipelines-as-code-controller:9090/proxy/metrics", base)},
-		{name: "watcher", svcPath: fmt.Sprintf("%s/pipelines-as-code-watcher:9090/proxy/metrics", base)},
-	}
-}
-
-func buildScopes(endpoints []endpointDef) []scopeDef {
-	return []scopeDef{
-		{name: "all", endpointIndexes: []int{0, 1}},
-		{name: "controller", endpointIndexes: []int{0}},
-		{name: "watcher", endpointIndexes: []int{1}},
-	}
-}
-
-func normalizeSortMode(raw string) (sortMode, error) {
-	switch sortMode(strings.ToLower(strings.TrimSpace(raw))) {
-	case "", sortByDelta:
-		return sortByDelta, nil
-	case sortByAlpha:
-		return sortByAlpha, nil
-	default:
-		return "", fmt.Errorf("unsupported sort mode %q", raw)
-	}
-}
-
-func normalizeOutputMode(raw string) (string, error) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "", defaultSnapshotMode:
-		return defaultSnapshotMode, nil
-	case "tsv":
-		return "tsv", nil
-	default:
-		return "", fmt.Errorf("unsupported output mode %q", raw)
-	}
-}
-
-func scopeIndex(scopes []scopeDef, name string) (int, error) {
-	needle := strings.ToLower(strings.TrimSpace(name))
-	for i, scope := range scopes {
-		if scope.name == needle {
-			return i, nil
-		}
-	}
-	return -1, fmt.Errorf("unsupported endpoint %q", name)
-}
-
-func scrapeMetrics(ctx context.Context, kubeconfig, svcPath string) (map[string]float64, error) {
-	args := []string{"get", "--raw", svcPath}
-	if kubeconfig != "" {
-		args = append([]string{"--kubeconfig", kubeconfig}, args...)
-	}
-
-	cmd := exec.CommandContext(ctx, "kubectl", args...)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		output := strings.TrimSpace(string(out))
-		if output == "" {
-			return nil, fmt.Errorf("kubectl: %w", err)
-		}
-		return nil, fmt.Errorf("kubectl: %s: %w", output, err)
-	}
-
-	return parseMetrics(string(out))
-}
-
-func parseMetrics(data string) (map[string]float64, error) {
-	result := map[string]float64{}
-	scanner := bufio.NewScanner(strings.NewReader(data))
-	for scanner.Scan() {
-		line := scanner.Text()
-		if strings.HasPrefix(line, "#") || strings.TrimSpace(line) == "" {
-			continue
-		}
-
-		parts := strings.Fields(line)
-		if len(parts) < 2 {
-			continue
-		}
-
-		val, err := strconv.ParseFloat(parts[1], 64)
-		if err != nil {
-			continue
-		}
-
-		name := parts[0]
-		if idx := strings.Index(name, "{"); idx >= 0 {
-			name = name[:idx]
-		}
-		result[name] += val
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan metrics: %w", err)
-	}
-
-	return result, nil
-}
-
-func interestingMetric(name string) bool {
-	for _, prefix := range []string{
-		"pac_",
-		"workqueue_",
-		"reconciler_",
-		"controller_",
-		"controller_runtime_",
-		"tekton_",
-		"grpc_",
-	} {
-		if strings.HasPrefix(name, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func canonicalMetricName(name string) string {
-	for _, prefix := range []string{"pac_controller_", "pac_watcher_"} {
-		if strings.HasPrefix(name, prefix) {
-			return strings.TrimPrefix(name, prefix)
-		}
-	}
-	return name
-}
-
-func matchesSignal(name string, signal signalDefinition) bool {
-	canonical := canonicalMetricName(name)
-	for _, exact := range signal.Exact {
-		if canonical == exact {
-			return true
-		}
-	}
-	for _, prefix := range signal.Prefixes {
-		if strings.HasPrefix(canonical, prefix) {
-			return true
-		}
-	}
-	return false
-}
-
-func sparkline(values []float64) string {
-	if len(values) == 0 {
-		return ""
-	}
-
-	minValue, maxValue := values[0], values[0]
-	for _, value := range values {
-		if value < minValue {
-			minValue = value
-		}
-		if value > maxValue {
-			maxValue = value
-		}
-	}
-
-	chars := []rune(sparkChars)
-	maxIndex := float64(len(chars) - 1)
-	var builder strings.Builder
-	for _, value := range values {
-		index := 0
-		if maxValue > minValue {
-			index = int(math.Round((value - minValue) / (maxValue - minValue) * maxIndex))
-		}
-		if index < 0 {
-			index = 0
-		}
-		if index >= len(chars) {
-			index = len(chars) - 1
-		}
-		builder.WriteRune(chars[index])
-	}
-	return builder.String()
-}
-
-func formatMetricNumber(value float64) string {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return fmt.Sprintf("%g", value)
-	}
-	if math.Abs(value-math.Round(value)) < 1e-9 {
-		return fmt.Sprintf("%.0f", value)
-	}
-	return fmt.Sprintf("%.3f", value)
-}
-
-func formatDelta(value float64) string {
-	if math.IsNaN(value) || math.IsInf(value, 0) {
-		return fmt.Sprintf("%+g", value)
-	}
-	if math.Abs(value-math.Round(value)) < 1e-9 {
-		return fmt.Sprintf("%+.0f", value)
-	}
-	return fmt.Sprintf("%+.3f", value)
-}
-
-func metricAllowed(name string, pacOnly bool, filter string) bool {
-	if pacOnly {
-		if !strings.HasPrefix(canonicalMetricName(name), "pipelines_as_code_") {
-			return false
-		}
-	} else if !interestingMetric(name) {
-		return false
-	}
-
-	if filter == "" {
-		return true
-	}
-	return strings.Contains(strings.ToLower(name), strings.ToLower(filter))
-}
-
-func sortRows(rows []metricRow, mode sortMode, byDelta bool) {
-	switch mode {
-	case sortByAlpha:
-		sort.Slice(rows, func(i, j int) bool {
-			return rows[i].Name < rows[j].Name
-		})
-	default:
-		sort.Slice(rows, func(i, j int) bool {
-			left := rows[i].Value
-			right := rows[j].Value
-			if byDelta {
-				left = math.Abs(rows[i].Delta)
-				right = math.Abs(rows[j].Delta)
-			}
-			if left == right {
-				return rows[i].Name < rows[j].Name
-			}
-			return left > right
-		})
-	}
-}
-
-func buildRowsFromHistory(history map[string][]float64, delta map[string]float64, pacOnly bool, filter string, mode sortMode) []metricRow {
-	rows := make([]metricRow, 0, len(history))
-	for name, hist := range history {
-		if !metricAllowed(name, pacOnly, filter) {
-			continue
-		}
-		value := 0.0
-		if len(hist) > 0 {
-			value = hist[len(hist)-1]
-		}
-		rows = append(rows, metricRow{
-			Name:    name,
-			Value:   value,
-			Delta:   delta[name],
-			History: hist,
-		})
-	}
-	sortRows(rows, mode, true)
-	return rows
-}
-
-func aggregateHistories(history map[string][]float64, names []string) []float64 {
-	maxLen := 0
-	for _, name := range names {
-		if len(history[name]) > maxLen {
-			maxLen = len(history[name])
-		}
-	}
-	if maxLen == 0 {
-		return nil
-	}
-
-	aggregated := make([]float64, maxLen)
-	for _, name := range names {
-		hist := history[name]
-		offset := maxLen - len(hist)
-		for i, value := range hist {
-			aggregated[offset+i] += value
-		}
-	}
-	return aggregated
-}
-
-func buildDashboardRows(history map[string][]float64, delta map[string]float64) []dashboardRow {
-	rows := make([]dashboardRow, 0, 12)
-	for _, group := range dashboardGroups {
-		for _, signal := range group.Signals {
-			sources := make([]string, 0, 2)
-			totalDelta := 0.0
-			for name := range history {
-				if matchesSignal(name, signal) {
-					sources = append(sources, name)
-					totalDelta += delta[name]
-				}
-			}
-			sort.Strings(sources)
-
-			row := dashboardRow{
-				Group:       group.Title,
-				Description: group.Description,
-				Signal:      signal,
-				Delta:       totalDelta,
-				Sources:     sources,
-				Available:   len(sources) > 0,
-			}
-			if row.Available {
-				row.History = aggregateHistories(history, sources)
-				if len(row.History) > 0 {
-					row.Value = row.History[len(row.History)-1]
-				}
-			}
-			rows = append(rows, row)
-		}
-	}
-	return rows
-}
-
-func signalRowsFromMetrics(metrics map[string]float64) []dashboardRow {
-	history := make(map[string][]float64, len(metrics))
-	for name, value := range metrics {
-		history[name] = []float64{value}
-	}
-	return buildDashboardRows(history, map[string]float64{})
-}
-
-func renderSnapshot(scope string, collectedAt time.Time, metrics map[string]float64, output string) string {
-	var builder strings.Builder
-	if output == "tsv" {
-		rows := make([]metricRow, 0, len(metrics))
-		for name, value := range metrics {
-			rows = append(rows, metricRow{Name: name, Value: value})
-		}
-		sortRows(rows, sortByAlpha, false)
-
-		fmt.Fprintf(&builder, "# scope=%s\n", scope)
-		fmt.Fprintf(&builder, "# timestamp=%s\n", collectedAt.Format(time.RFC3339))
-		builder.WriteString("metric\tvalue\n")
-		for _, row := range rows {
-			fmt.Fprintf(&builder, "%s\t%s\n", row.Name, formatMetricNumber(row.Value))
-		}
-		return builder.String()
-	}
-
-	dashboardRows := signalRowsFromMetrics(metrics)
-	tabWriter := tabwriter.NewWriter(&builder, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintf(tabWriter, "scope:\t%s\n", scope)
-	_, _ = fmt.Fprintf(tabWriter, "timestamp:\t%s\n", collectedAt.Format(time.RFC3339))
-	_ = tabWriter.Flush()
-	builder.WriteString("\n")
-
-	lastGroup := ""
-	tabWriter = tabwriter.NewWriter(&builder, 0, 4, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tabWriter, "GROUP\tSIGNAL\tVALUE\tWHY IT MATTERS")
-	for _, row := range dashboardRows {
-		if row.Group != lastGroup {
-			lastGroup = row.Group
-		}
-		value := "n/a"
-		if row.Available {
-			value = formatMetricNumber(row.Value)
-		}
-		_, _ = fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\n", row.Group, row.Signal.Title, value, row.Signal.Why)
-	}
-	_ = tabWriter.Flush()
-	return builder.String()
-}
-
-func runSnapshot(config snapshotConfig, scraper scrapeFunc) (string, error) {
-	endpoints := buildEndpoints(config.namespace)
-	scopes := buildScopes(endpoints)
-	index, err := scopeIndex(scopes, config.scope)
-	if err != nil {
-		return "", err
-	}
-
-	scope := scopes[index]
-	metrics := map[string]float64{}
-	for _, endpointIndex := range scope.endpointIndexes {
-		endpoint := endpoints[endpointIndex]
-		scrapedMetrics, err := scraper(context.Background(), config.kubeconfig, endpoint.svcPath)
-		if err != nil {
-			return "", fmt.Errorf("%s: %w", endpoint.name, err)
-		}
-		for name, value := range scrapedMetrics {
-			metrics[name] += value
-		}
-	}
-
-	return renderSnapshot(scope.name, time.Now(), metrics, config.output), nil
-}
-
-func initialModel(kubeconfig, namespace string, interval time.Duration, pacOnly bool, initialScope int, mode sortMode, filter string, scraper scrapeFunc) *model {
-	endpoints := buildEndpoints(namespace)
-	if scraper == nil {
-		scraper = scrapeMetrics
-	}
+func initialModel(kubeconfig, namespace string, interval time.Duration, pacOnly bool, initialScope int, mode metrics.SortMode, filter string, scraper metrics.ScrapeFunc) *model {
+	endpoints := metrics.BuildEndpoints(namespace)
 
 	return &model{
 		kubeconfig:  kubeconfig,
@@ -655,7 +110,7 @@ func initialModel(kubeconfig, namespace string, interval time.Duration, pacOnly 
 		interval:    interval,
 		pacOnly:     pacOnly,
 		endpoints:   endpoints,
-		scopes:      buildScopes(endpoints),
+		scopes:      metrics.BuildScopes(endpoints),
 		scraper:     scraper,
 		activeScope: initialScope,
 		history:     map[string][]float64{},
@@ -663,7 +118,7 @@ func initialModel(kubeconfig, namespace string, interval time.Duration, pacOnly 
 		sortMode:    mode,
 		filter:      filter,
 		filterInput: filter,
-		viewMode:    viewDashboard,
+		viewMode:    metrics.ViewDashboard,
 	}
 }
 
@@ -682,19 +137,19 @@ func (m *model) resetMetrics() {
 	m.lastUpdate = time.Time{}
 	m.lastDuration = 0
 	m.err = ""
+	m.labeledSnapshot = nil
 }
 
 func (m *model) recomputeRows() {
-	rows := buildRowsFromHistory(m.history, m.delta, m.pacOnly, m.filter, m.sortMode)
+	rows := metrics.BuildRowsFromHistory(m.history, m.delta, m.pacOnly, m.filter, m.sortMode)
 	m.keys = make([]string, 0, len(rows))
 	for _, row := range rows {
 		m.keys = append(m.keys, row.Name)
 	}
-
 	m.clampCursor()
 }
 
-func (m *model) currentScope() scopeDef {
+func (m *model) currentScope() metrics.ScopeDef {
 	return m.scopes[m.activeScope]
 }
 
@@ -711,27 +166,61 @@ func (m *model) beginScrape() tea.Cmd {
 	m.cancelScrape = cancel
 	m.scraping = true
 
+	kubeconfig := m.kubeconfig
+	scraper := m.scraper
+	endpointsCopy := m.endpoints
+
+	useRawScrape := scraper == nil
 	return func() tea.Msg {
 		startedAt := time.Now()
 		mergedMetrics := map[string]float64{}
+		rawData := map[string]string{}
 		var scrapeErrors []string
-		for _, endpointIndex := range scope.endpointIndexes {
-			endpoint := m.endpoints[endpointIndex]
-			metrics, err := m.scraper(ctx, m.kubeconfig, endpoint.svcPath)
-			if err != nil {
-				if errors.Is(err, context.Canceled) {
-					return scrapeCycleResultMsg{
-						id:       id,
-						scope:    scopeIndex,
-						err:      context.Canceled,
-						duration: time.Since(startedAt),
+		for _, endpointIndex := range scope.EndpointIndexes {
+			endpoint := endpointsCopy[endpointIndex]
+
+			if useRawScrape {
+				// Scrape raw text once and parse both ways
+				raw, rawErr := kubectl.ScrapeRawMetrics(ctx, kubeconfig, endpoint.SvcPath)
+				if rawErr != nil {
+					if errors.Is(rawErr, context.Canceled) {
+						return scrapeCycleResultMsg{
+							id:       id,
+							scope:    scopeIndex,
+							err:      context.Canceled,
+							duration: time.Since(startedAt),
+						}
 					}
+					scrapeErrors = append(scrapeErrors, fmt.Sprintf("%s: %v", endpoint.Name, rawErr))
+					continue
 				}
-				scrapeErrors = append(scrapeErrors, fmt.Sprintf("%s: %v", endpoint.name, err))
-				continue
-			}
-			for name, value := range metrics {
-				mergedMetrics[name] += value
+
+				ms, parseErr := metrics.ParseMetrics(raw)
+				if parseErr != nil {
+					scrapeErrors = append(scrapeErrors, fmt.Sprintf("%s: %v", endpoint.Name, parseErr))
+					continue
+				}
+				for name, value := range ms {
+					mergedMetrics[name] += value
+				}
+				rawData[endpoint.Name] = raw
+			} else {
+				ms, err := scraper(ctx, kubeconfig, endpoint.SvcPath)
+				if err != nil {
+					if errors.Is(err, context.Canceled) {
+						return scrapeCycleResultMsg{
+							id:       id,
+							scope:    scopeIndex,
+							err:      context.Canceled,
+							duration: time.Since(startedAt),
+						}
+					}
+					scrapeErrors = append(scrapeErrors, fmt.Sprintf("%s: %v", endpoint.Name, err))
+					continue
+				}
+				for name, value := range ms {
+					mergedMetrics[name] += value
+				}
 			}
 		}
 
@@ -744,6 +233,7 @@ func (m *model) beginScrape() tea.Cmd {
 			id:       id,
 			scope:    scopeIndex,
 			metrics:  mergedMetrics,
+			rawData:  rawData,
 			err:      scrapeErr,
 			duration: time.Since(startedAt),
 		}
@@ -758,9 +248,9 @@ func (m *model) cancelActiveScrape() {
 	m.scraping = false
 }
 
-func (m *model) applyMetrics(metrics map[string]float64) {
-	seen := make(map[string]struct{}, len(metrics))
-	for name, value := range metrics {
+func (m *model) applyMetrics(msg scrapeCycleResultMsg) {
+	seen := make(map[string]struct{}, len(msg.metrics))
+	for name, value := range msg.metrics {
 		prev := 0.0
 		if hist := m.history[name]; len(hist) > 0 {
 			prev = hist[len(hist)-1]
@@ -784,6 +274,26 @@ func (m *model) applyMetrics(metrics map[string]float64) {
 		delete(m.delta, name)
 	}
 
+	// Build labeled snapshot from raw data
+	if len(msg.rawData) > 0 {
+		labeled := map[string]*metrics.MetricFamily{}
+		for _, raw := range msg.rawData {
+			parsed, err := metrics.ParseWithLabels(raw)
+			if err != nil {
+				continue
+			}
+			for name, family := range parsed {
+				if existing, ok := labeled[name]; ok {
+					existing.Samples = append(existing.Samples, family.Samples...)
+					existing.Total += family.Total
+				} else {
+					labeled[name] = family
+				}
+			}
+		}
+		m.labeledSnapshot = labeled
+	}
+
 	m.recomputeRows()
 }
 
@@ -796,10 +306,16 @@ func (m *model) maxVisibleRows() int {
 }
 
 func (m *model) activeLen() int {
-	if m.viewMode == viewDashboard {
-		return len(buildDashboardRows(m.history, m.delta))
+	switch m.viewMode {
+	case metrics.ViewDashboard:
+		return len(metrics.BuildDashboardRows(m.history, m.delta))
+	case metrics.ViewRepos:
+		return len(m.repoStatuses)
+	case metrics.ViewEvents:
+		return len(m.events)
+	default:
+		return len(m.keys)
 	}
-	return len(m.keys)
 }
 
 func (m *model) clampCursor() {
@@ -838,6 +354,7 @@ func (m *model) ensureCursorVisible() {
 		m.visibleStart = 0
 	}
 }
+
 func (m *model) handleFilterKey(msg tea.KeyPressMsg) {
 	switch msg.String() {
 	case "esc":
@@ -866,9 +383,9 @@ func (m *model) handleFilterKey(msg tea.KeyPressMsg) {
 	}
 }
 
-func (m *model) selectedRawRow() (metricRow, bool) {
+func (m *model) selectedRawRow() (metrics.MetricRow, bool) {
 	if len(m.keys) == 0 || m.cursor < 0 || m.cursor >= len(m.keys) {
-		return metricRow{}, false
+		return metrics.MetricRow{}, false
 	}
 	name := m.keys[m.cursor]
 	hist := m.history[name]
@@ -876,7 +393,7 @@ func (m *model) selectedRawRow() (metricRow, bool) {
 	if len(hist) > 0 {
 		value = hist[len(hist)-1]
 	}
-	return metricRow{
+	return metrics.MetricRow{
 		Name:    name,
 		Value:   value,
 		Delta:   m.delta[name],
@@ -884,18 +401,18 @@ func (m *model) selectedRawRow() (metricRow, bool) {
 	}, true
 }
 
-func (m *model) selectedDashboardRow() (dashboardRow, bool) {
-	rows := buildDashboardRows(m.history, m.delta)
+func (m *model) selectedDashboardRow() (metrics.DashboardRow, bool) {
+	rows := metrics.BuildDashboardRows(m.history, m.delta)
 	if len(rows) == 0 || m.cursor < 0 || m.cursor >= len(rows) {
-		return dashboardRow{}, false
+		return metrics.DashboardRow{}, false
 	}
 	return rows[m.cursor], true
 }
 
 func (m *model) summarySignals() []components.CardData {
-	rows := buildDashboardRows(m.history, m.delta)
+	rows := metrics.BuildDashboardRows(m.history, m.delta)
 	ids := []string{"git-api-requests", "pipelineruns-created", "running-pipelineruns", "workqueue-depth"}
-	byID := make(map[string]dashboardRow, len(rows))
+	byID := make(map[string]metrics.DashboardRow, len(rows))
 	for _, row := range rows {
 		byID[row.Signal.ID] = row
 	}
@@ -904,20 +421,135 @@ func (m *model) summarySignals() []components.CardData {
 		if row, ok := byID[id]; ok {
 			trend := ""
 			if row.Available {
-				trend = sparkline(row.History)
+				trend = metrics.Sparkline(row.History)
 			}
 			result = append(result, components.CardData{
-				Title:    row.Signal.Title,
-				Value:    formatMetricNumber(row.Value),
-				Delta:    formatDelta(row.Delta),
-				Trend:    trend,
+				Title:     row.Signal.Title,
+				Value:     metrics.FormatMetricNumber(row.Value),
+				Delta:     metrics.FormatDelta(row.Delta),
+				Trend:     trend,
 				Available: row.Available,
-				SignalID: row.Signal.ID,
-				DeltaNum: row.Delta,
+				SignalID:  row.Signal.ID,
+				DeltaNum:  row.Delta,
 			})
 		}
 	}
 	return result
+}
+
+func fetchViewIfNeeded(m *model, view metrics.ViewMode) (tea.Model, tea.Cmd) {
+	switch view {
+	case metrics.ViewHealth:
+		if !m.healthLoading {
+			m.healthLoading = true
+			return m, m.runHealthChecks()
+		}
+	case metrics.ViewRepos:
+		if !m.reposLoading {
+			m.reposLoading = true
+			return m, m.fetchRepoStatuses()
+		}
+	case metrics.ViewEvents:
+		if !m.eventsLoading {
+			m.eventsLoading = true
+			return m, m.fetchEvents()
+		}
+	}
+	return m, nil
+}
+
+func collectHealthChecks(ctx context.Context, kubeconfig, namespace string, endpoints []metrics.EndpointDef, scope metrics.ScopeDef) []views.HealthCheck {
+	var checks []views.HealthCheck
+
+	pods, err := kubectl.GetPACPods(ctx, kubeconfig, namespace)
+	if err != nil {
+		checks = append(checks, views.HealthCheck{Name: "PAC Pods", Status: "fail", Detail: err.Error()})
+	} else if len(pods) == 0 {
+		checks = append(checks, views.HealthCheck{Name: "PAC Pods", Status: "fail", Detail: "No PAC pods found"})
+	} else {
+		for _, pod := range pods {
+			status := "pass"
+			detail := fmt.Sprintf("Phase=%s Restarts=%d Age=%s", pod.Phase, pod.Restarts, pod.Age)
+			if pod.Phase != "Running" {
+				status = "fail"
+			} else if !pod.Ready {
+				status = "warn"
+				detail += " (not ready)"
+			} else if pod.Restarts > 5 {
+				status = "warn"
+				detail += " (high restart count)"
+			}
+			checks = append(checks, views.HealthCheck{Name: "Pod: " + pod.Name, Status: status, Detail: detail})
+		}
+	}
+
+	for _, endpointIndex := range scope.EndpointIndexes {
+		endpoint := endpoints[endpointIndex]
+		scrapeCtx, scrapeCancel := context.WithTimeout(ctx, 5*time.Second)
+		_, scrapeErr := kubectl.ScrapeMetrics(scrapeCtx, kubeconfig, endpoint.SvcPath)
+		scrapeCancel()
+		if scrapeErr != nil {
+			checks = append(checks, views.HealthCheck{Name: "Metrics: " + endpoint.Name, Status: "fail", Detail: scrapeErr.Error()})
+		} else {
+			checks = append(checks, views.HealthCheck{Name: "Metrics: " + endpoint.Name, Status: "pass", Detail: "reachable"})
+		}
+	}
+
+	crdExists, _ := kubectl.CheckRepositoryCRD(ctx, kubeconfig)
+	if crdExists {
+		checks = append(checks, views.HealthCheck{Name: "Repository CRD", Status: "pass", Detail: "registered"})
+	} else {
+		checks = append(checks, views.HealthCheck{Name: "Repository CRD", Status: "fail", Detail: "not found"})
+	}
+
+	cmExists, _ := kubectl.CheckConfigMap(ctx, kubeconfig, namespace)
+	if cmExists {
+		checks = append(checks, views.HealthCheck{Name: "ConfigMap: pipelines-as-code", Status: "pass", Detail: "exists"})
+	} else {
+		checks = append(checks, views.HealthCheck{Name: "ConfigMap: pipelines-as-code", Status: "warn", Detail: "not found in " + namespace})
+	}
+
+	return checks
+}
+
+func (m *model) runHealthChecks() tea.Cmd {
+	kubeconfig := m.kubeconfig
+	namespace := m.namespace
+	endpoints := m.endpoints
+	scope := m.currentScope()
+
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		return healthCheckResultMsg{checks: collectHealthChecks(ctx, kubeconfig, namespace, endpoints, scope)}
+	}
+}
+
+func (m *model) fetchRepoStatuses() tea.Cmd {
+	kubeconfig := m.kubeconfig
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		repos, err := kubectl.GetRepositoryStatuses(ctx, kubeconfig)
+		if err != nil {
+			return repoStatusResultMsg{err: err}
+		}
+		return repoStatusResultMsg{repos: repos}
+	}
+}
+
+func (m *model) fetchEvents() tea.Cmd {
+	kubeconfig := m.kubeconfig
+	namespace := m.namespace
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		events, err := kubectl.GetPACEvents(ctx, kubeconfig, namespace)
+		if err != nil {
+			return eventsResultMsg{err: err}
+		}
+		return eventsResultMsg{events: events}
+	}
 }
 
 func (m *model) Init() tea.Cmd {
@@ -957,9 +589,34 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if len(msg.metrics) > 0 {
 			m.lastUpdate = time.Now()
-			m.applyMetrics(msg.metrics)
+			m.applyMetrics(msg)
 		}
 		return m, doTick(m.interval)
+
+	case healthCheckResultMsg:
+		m.healthLoading = false
+		m.healthChecks = msg.checks
+		return m, nil
+
+	case repoStatusResultMsg:
+		m.reposLoading = false
+		m.repoStatuses = msg.repos
+		if msg.err != nil {
+			m.reposErr = fmt.Sprintf("error fetching repositories: %v", msg.err)
+		} else {
+			m.reposErr = ""
+		}
+		return m, nil
+
+	case eventsResultMsg:
+		m.eventsLoading = false
+		m.events = msg.events
+		if msg.err != nil {
+			m.eventsErr = fmt.Sprintf("error fetching events: %v", msg.err)
+		} else {
+			m.eventsErr = ""
+		}
+		return m, nil
 
 	case tea.KeyPressMsg:
 		if m.filterMode {
@@ -976,23 +633,49 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pacOnly = !m.pacOnly
 			m.recomputeRows()
 		case "s":
-			if m.sortMode == sortByDelta {
-				m.sortMode = sortByAlpha
+			if m.sortMode == metrics.SortByDelta {
+				m.sortMode = metrics.SortByAlpha
 			} else {
-				m.sortMode = sortByDelta
+				m.sortMode = metrics.SortByDelta
 			}
 			m.recomputeRows()
 		case "d":
-			m.viewMode = viewDashboard
+			m.viewMode = metrics.ViewDashboard
 			m.cursor = 0
 			m.visibleStart = 0
+			m.showLabels = false
 		case "r":
-			m.viewMode = viewRaw
+			m.viewMode = metrics.ViewRaw
 			m.cursor = 0
 			m.visibleStart = 0
+			m.showLabels = false
 			m.recomputeRows()
+		case "h":
+			m.viewMode = metrics.ViewHealth
+			m.cursor = 0
+			m.visibleStart = 0
+			m.showLabels = false
+			return fetchViewIfNeeded(m, metrics.ViewHealth)
+		case "p":
+			m.viewMode = metrics.ViewRepos
+			m.cursor = 0
+			m.visibleStart = 0
+			m.showLabels = false
+			return fetchViewIfNeeded(m, metrics.ViewRepos)
+		case "e":
+			m.viewMode = metrics.ViewEvents
+			m.cursor = 0
+			m.visibleStart = 0
+			m.showLabels = false
+			return fetchViewIfNeeded(m, metrics.ViewEvents)
+		case "enter":
+			if m.viewMode == metrics.ViewDashboard {
+				m.showLabels = !m.showLabels
+			}
+		case "esc":
+			m.showLabels = false
 		case "/":
-			if m.viewMode == viewRaw {
+			if m.viewMode == metrics.ViewRaw {
 				m.filterMode = true
 				m.filterInput = m.filter
 			}
@@ -1019,9 +702,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-
 func (m *model) renderDashboardRows(width int) ([]string, string) {
-	rows := buildDashboardRows(m.history, m.delta)
+	rows := metrics.BuildDashboardRows(m.history, m.delta)
 	maxRows := m.maxVisibleRows()
 	m.ensureCursorVisible()
 
@@ -1058,9 +740,9 @@ func (m *model) renderDashboardRows(width int) ([]string, string) {
 		graph := ""
 		rowStyle := theme.StyleUnavailable
 		if row.Available {
-			value = formatMetricNumber(row.Value)
-			delta = formatDelta(row.Delta)
-			graph = sparkline(row.History)
+			value = metrics.FormatMetricNumber(row.Value)
+			delta = metrics.FormatDelta(row.Delta)
+			graph = metrics.Sparkline(row.History)
 			graphRunes := []rune(graph)
 			if len(graphRunes) > 12 {
 				graph = string(graphRunes[len(graphRunes)-12:])
@@ -1079,36 +761,63 @@ func (m *model) renderDashboardRows(width int) ([]string, string) {
 		})
 	}
 
-	// Calculate correct cursor for table (accounting for group rows)
-	rendered := components.RenderTable(columns, tableRows, m.cursor - m.visibleStart)
+	rendered := components.RenderTable(columns, tableRows, m.cursor-m.visibleStart)
 
 	detail := theme.StyleDim.Render("selected: <none>")
 	if row, ok := m.selectedDashboardRow(); ok {
-		sources := "<none>"
-		if len(row.Sources) > 0 {
-			sources = strings.Join(row.Sources, ", ")
-		}
+		if m.showLabels {
+			// Show label breakdown instead of chart
+			detail = m.renderLabelDetail(row, width)
+		} else {
+			sources := "<none>"
+			if len(row.Sources) > 0 {
+				sources = strings.Join(row.Sources, ", ")
+			}
 
-		valStr := "n/a"
-		deltaStr := "n/a"
-		if row.Available {
-			valStr = formatMetricNumber(row.Value)
-			deltaStr = formatDelta(row.Delta)
-		}
+			valStr := "n/a"
+			deltaStr := "n/a"
+			if row.Available {
+				valStr = metrics.FormatMetricNumber(row.Value)
+				deltaStr = metrics.FormatDelta(row.Delta)
+			}
 
-		detail = components.RenderDetailPane(
-			row.Signal.Title,
-			row.Signal.Kind,
-			valStr,
-			deltaStr,
-			row.Signal.Description,
-			sources,
-			row.History,
-			width,
-		)
+			detail = components.RenderDetailPane(
+				row.Signal.Title,
+				row.Signal.Kind,
+				valStr,
+				deltaStr,
+				row.Signal.Description,
+				sources,
+				row.History,
+				width,
+			)
+		}
 	}
 
 	return rendered, detail
+}
+
+func (m *model) renderLabelDetail(row metrics.DashboardRow, width int) string {
+	if m.labeledSnapshot == nil {
+		return theme.StyleDim.Render("No label data available (waiting for next scrape)")
+	}
+
+	// Find matching metric families for this signal
+	var combined *metrics.MetricFamily
+	for name, family := range m.labeledSnapshot {
+		if metrics.MatchesSignal(name, row.Signal) {
+			if combined == nil {
+				combined = &metrics.MetricFamily{
+					Name:    row.Signal.Title,
+					Samples: make([]metrics.LabeledSample, 0, len(family.Samples)),
+				}
+			}
+			combined.Samples = append(combined.Samples, family.Samples...)
+			combined.Total += family.Total
+		}
+	}
+
+	return views.RenderLabelBreakdown(combined, width)
 }
 
 func (m *model) renderRawRows(width int) ([]string, string) {
@@ -1138,7 +847,7 @@ func (m *model) renderRawRows(width int) ([]string, string) {
 			value = hist[len(hist)-1]
 		}
 
-		graph := sparkline(hist)
+		graph := metrics.Sparkline(hist)
 		graphRunes := []rune(graph)
 		if len(graphRunes) > 20 {
 			graph = string(graphRunes[len(graphRunes)-20:])
@@ -1150,7 +859,7 @@ func (m *model) renderRawRows(width int) ([]string, string) {
 		}
 
 		tableRows = append(tableRows, components.TableRow{
-			Columns:    []string{name, formatMetricNumber(value), formatDelta(m.delta[name]), graph},
+			Columns:    []string{name, metrics.FormatMetricNumber(value), metrics.FormatDelta(m.delta[name]), graph},
 			Style:      rowStyle,
 			DeltaValue: m.delta[name],
 		})
@@ -1164,7 +873,7 @@ func (m *model) renderRawRows(width int) ([]string, string) {
 		}
 		rendered = append(rendered, theme.StyleDim.Render(message))
 	} else {
-		rendered = components.RenderTable(columns, tableRows, m.cursor - m.visibleStart)
+		rendered = components.RenderTable(columns, tableRows, m.cursor-m.visibleStart)
 	}
 
 	detail := theme.StyleDim.Render("selected: <none>")
@@ -1172,9 +881,9 @@ func (m *model) renderRawRows(width int) ([]string, string) {
 		detail = components.RenderDetailPane(
 			row.Name,
 			"raw",
-			formatMetricNumber(row.Value),
-			formatDelta(row.Delta),
-			fmt.Sprintf("samples=%d canonical=%s", len(row.History), canonicalMetricName(row.Name)),
+			metrics.FormatMetricNumber(row.Value),
+			metrics.FormatDelta(row.Delta),
+			fmt.Sprintf("samples=%d canonical=%s", len(row.History), metrics.CanonicalMetricName(row.Name)),
 			"kubectl",
 			row.History,
 			width,
@@ -1182,7 +891,6 @@ func (m *model) renderRawRows(width int) ([]string, string) {
 	}
 	return rendered, detail
 }
-
 
 func (m *model) View() tea.View {
 	width := m.width
@@ -1197,7 +905,7 @@ func (m *model) View() tea.View {
 
 	scopeStrs := make([]string, len(m.scopes))
 	for i, s := range m.scopes {
-		scopeStrs[i] = s.name
+		scopeStrs[i] = s.Name
 	}
 
 	header := components.RenderHeader(
@@ -1214,25 +922,235 @@ func (m *model) View() tea.View {
 
 	separator := theme.StyleSep.Render(strings.Repeat("─", width))
 	thinSep := theme.StyleSep.Render(strings.Repeat("╌", width))
-	summary := components.RenderSummaryCards(m.summarySignals(), width)
 
 	var rows []string
 	var detail string
-	if m.viewMode == viewDashboard {
+
+	switch m.viewMode {
+	case metrics.ViewDashboard:
+		summary := components.RenderSummaryCards(m.summarySignals(), width)
 		rows, detail = m.renderDashboardRows(width)
-	} else {
+		footer := components.RenderFooter(m.err, m.filterMode, m.filterInput, width)
+		parts := []string{header, separator, summary, thinSep}
+		parts = append(parts, rows...)
+		parts = append(parts, separator, detail, "", footer)
+		view := tea.NewView(strings.Join(parts, "\n"))
+		view.AltScreen = true
+		return view
+
+	case metrics.ViewRaw:
+		summary := components.RenderSummaryCards(m.summarySignals(), width)
 		rows, detail = m.renderRawRows(width)
+		footer := components.RenderFooter(m.err, m.filterMode, m.filterInput, width)
+		parts := []string{header, separator, summary, thinSep}
+		parts = append(parts, rows...)
+		parts = append(parts, separator, detail, "", footer)
+		view := tea.NewView(strings.Join(parts, "\n"))
+		view.AltScreen = true
+		return view
+
+	case metrics.ViewHealth:
+		healthContent := views.RenderHealthView(m.healthChecks, m.healthLoading, width)
+		footer := components.RenderFooter(m.err, false, "", width)
+		parts := []string{header, separator, healthContent, "", footer}
+		view := tea.NewView(strings.Join(parts, "\n"))
+		view.AltScreen = true
+		return view
+
+	case metrics.ViewRepos:
+		rows, detail = views.RenderReposView(m.repoStatuses, m.cursor, m.visibleStart, m.maxVisibleRows(), width, m.reposLoading, m.reposErr)
+		footer := components.RenderFooter(m.err, false, "", width)
+		parts := []string{header, separator}
+		parts = append(parts, rows...)
+		if detail != "" {
+			parts = append(parts, separator, detail)
+		}
+		parts = append(parts, "", footer)
+		view := tea.NewView(strings.Join(parts, "\n"))
+		view.AltScreen = true
+		return view
+
+	case metrics.ViewEvents:
+		rows, detail = views.RenderEventsView(m.events, m.cursor, m.visibleStart, m.maxVisibleRows(), width, m.eventsLoading, m.eventsErr)
+		footer := components.RenderFooter(m.err, false, "", width)
+		parts := []string{header, separator}
+		parts = append(parts, rows...)
+		if detail != "" {
+			parts = append(parts, separator, detail)
+		}
+		parts = append(parts, "", footer)
+		view := tea.NewView(strings.Join(parts, "\n"))
+		view.AltScreen = true
+		return view
 	}
 
-	footer := components.RenderFooter(m.err, m.filterMode, m.filterInput, width)
-
-	parts := []string{header, separator, summary, thinSep}
-	parts = append(parts, rows...)
-	parts = append(parts, separator, detail, "", footer)
-
-	view := tea.NewView(strings.Join(parts, "\n"))
+	// fallback
+	view := tea.NewView(header)
 	view.AltScreen = true
 	return view
+}
+
+func renderSnapshot(scope string, collectedAt time.Time, m map[string]float64, output string) string {
+	var builder strings.Builder
+	if output == "tsv" {
+		rows := make([]metrics.MetricRow, 0, len(m))
+		for name, value := range m {
+			rows = append(rows, metrics.MetricRow{Name: name, Value: value})
+		}
+		metrics.SortRows(rows, metrics.SortByAlpha)
+
+		fmt.Fprintf(&builder, "# scope=%s\n", scope)
+		fmt.Fprintf(&builder, "# timestamp=%s\n", collectedAt.Format(time.RFC3339))
+		builder.WriteString("metric\tvalue\n")
+		for _, row := range rows {
+			fmt.Fprintf(&builder, "%s\t%s\n", row.Name, metrics.FormatMetricNumber(row.Value))
+		}
+		return builder.String()
+	}
+
+	dashboardRows := metrics.SignalRowsFromMetrics(m)
+	tabWriter := tabwriter.NewWriter(&builder, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintf(tabWriter, "scope:\t%s\n", scope)
+	_, _ = fmt.Fprintf(tabWriter, "timestamp:\t%s\n", collectedAt.Format(time.RFC3339))
+	_ = tabWriter.Flush()
+	builder.WriteString("\n")
+
+	lastGroup := ""
+	tabWriter = tabwriter.NewWriter(&builder, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tabWriter, "GROUP\tSIGNAL\tVALUE\tWHY IT MATTERS")
+	for _, row := range dashboardRows {
+		if row.Group != lastGroup {
+			lastGroup = row.Group
+		}
+		value := "n/a"
+		if row.Available {
+			value = metrics.FormatMetricNumber(row.Value)
+		}
+		_, _ = fmt.Fprintf(tabWriter, "%s\t%s\t%s\t%s\n", row.Group, row.Signal.Title, value, row.Signal.Why)
+	}
+	_ = tabWriter.Flush()
+	return builder.String()
+}
+
+func runSnapshot(config metrics.SnapshotConfig, scraper metrics.ScrapeFunc) (string, error) {
+	endpoints := metrics.BuildEndpoints(config.Namespace)
+	scopes := metrics.BuildScopes(endpoints)
+	index, err := metrics.ScopeIndex(scopes, config.Scope)
+	if err != nil {
+		return "", err
+	}
+
+	scope := scopes[index]
+
+	// Handle --view flag for non-metrics views
+	switch config.View {
+	case "health":
+		return runHealthSnapshot(config, endpoints, scope)
+	case "repos":
+		return runReposSnapshot(config)
+	case "events":
+		return runEventsSnapshot(config)
+	case "raw":
+		return runRawSnapshot(config, endpoints, scope, scraper)
+	}
+
+	m := map[string]float64{}
+	for _, endpointIndex := range scope.EndpointIndexes {
+		endpoint := endpoints[endpointIndex]
+		scrapedMetrics, err := scraper(context.Background(), config.Kubeconfig, endpoint.SvcPath)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", endpoint.Name, err)
+		}
+		for name, value := range scrapedMetrics {
+			m[name] += value
+		}
+	}
+
+	return renderSnapshot(scope.Name, time.Now(), m, config.Output), nil
+}
+
+func runHealthSnapshot(config metrics.SnapshotConfig, endpoints []metrics.EndpointDef, scope metrics.ScopeDef) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	checks := collectHealthChecks(ctx, config.Kubeconfig, config.Namespace, endpoints, scope)
+	return views.RenderHealthSnapshot(checks), nil
+}
+
+func runReposSnapshot(config metrics.SnapshotConfig) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	repos, err := kubectl.GetRepositoryStatuses(ctx, config.Kubeconfig)
+	if err != nil {
+		return "", fmt.Errorf("get repositories: %w", err)
+	}
+
+	return views.RenderReposSnapshot(repos), nil
+}
+
+func runEventsSnapshot(config metrics.SnapshotConfig) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	events, err := kubectl.GetPACEvents(ctx, config.Kubeconfig, config.Namespace)
+	if err != nil {
+		return "", fmt.Errorf("get events: %w", err)
+	}
+
+	return views.RenderEventsSnapshot(events), nil
+}
+
+func runRawSnapshot(config metrics.SnapshotConfig, endpoints []metrics.EndpointDef, scope metrics.ScopeDef, scraper metrics.ScrapeFunc) (string, error) {
+	m := map[string]float64{}
+	for _, endpointIndex := range scope.EndpointIndexes {
+		endpoint := endpoints[endpointIndex]
+		scrapedMetrics, err := scraper(context.Background(), config.Kubeconfig, endpoint.SvcPath)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", endpoint.Name, err)
+		}
+		for name, value := range scrapedMetrics {
+			m[name] += value
+		}
+	}
+
+	return renderRawSnapshot(scope.Name, time.Now(), m, config), nil
+}
+
+func renderRawSnapshot(scope string, collectedAt time.Time, m map[string]float64, config metrics.SnapshotConfig) string {
+	rows := make([]metrics.MetricRow, 0, len(m))
+	for name, value := range m {
+		if !metrics.MetricAllowed(name, config.PacOnly, config.Filter) {
+			continue
+		}
+		rows = append(rows, metrics.MetricRow{Name: name, Value: value})
+	}
+	metrics.SortRows(rows, config.SortMode)
+
+	var builder strings.Builder
+	if config.Output == "tsv" {
+		fmt.Fprintf(&builder, "# scope=%s view=raw\n", scope)
+		fmt.Fprintf(&builder, "# timestamp=%s\n", collectedAt.Format(time.RFC3339))
+		builder.WriteString("metric\tvalue\n")
+		for _, row := range rows {
+			fmt.Fprintf(&builder, "%s\t%s\n", row.Name, metrics.FormatMetricNumber(row.Value))
+		}
+		return builder.String()
+	}
+
+	tabWriter := tabwriter.NewWriter(&builder, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintf(tabWriter, "scope:\t%s\n", scope)
+	_, _ = fmt.Fprintf(tabWriter, "view:\traw\n")
+	_, _ = fmt.Fprintf(tabWriter, "timestamp:\t%s\n", collectedAt.Format(time.RFC3339))
+	_ = tabWriter.Flush()
+	builder.WriteString("\n")
+
+	tabWriter = tabwriter.NewWriter(&builder, 0, 4, 2, ' ', 0)
+	_, _ = fmt.Fprintln(tabWriter, "METRIC\tVALUE")
+	for _, row := range rows {
+		_, _ = fmt.Fprintf(tabWriter, "%s\t%s\n", row.Name, metrics.FormatMetricNumber(row.Value))
+	}
+	_ = tabWriter.Flush()
+	return builder.String()
 }
 
 func main() {
@@ -1242,37 +1160,39 @@ func main() {
 	pacOnly := flag.Bool("pac-only", false, "show only pac_ prefixed metrics in raw mode")
 	once := flag.Bool("once", false, "scrape once, print a report, and exit")
 	scopeFlag := flag.String("endpoint", "all", "scope to use: all, controller, or watcher")
-	sortFlag := flag.String("sort", string(sortByDelta), "sort order for raw mode: delta or alpha")
+	sortFlag := flag.String("sort", string(metrics.SortByDelta), "sort order for raw mode: delta or alpha")
 	filter := flag.String("filter", "", "substring filter for raw metric names")
 	output := flag.String("output", defaultSnapshotMode, "snapshot output format: table or tsv")
+	viewFlag := flag.String("view", "", "view for --once mode: dashboard, raw, health, repos, or events")
 	flag.Parse()
 
 	if *kubeconfig == "" {
 		*kubeconfig = os.Getenv("KUBECONFIG")
 	}
 
-	sortModeValue, err := normalizeSortMode(*sortFlag)
+	sortModeValue, err := metrics.NormalizeSortMode(*sortFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
-	outputMode, err := normalizeOutputMode(*output)
+	outputMode, err := metrics.NormalizeOutputMode(*output)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
 
 	if *once {
-		report, err := runSnapshot(snapshotConfig{
-			kubeconfig: *kubeconfig,
-			namespace:  *namespace,
-			scope:      *scopeFlag,
-			pacOnly:    *pacOnly,
-			filter:     *filter,
-			sortMode:   sortModeValue,
-			output:     outputMode,
-		}, scrapeMetrics)
+		report, err := runSnapshot(metrics.SnapshotConfig{
+			Kubeconfig: *kubeconfig,
+			Namespace:  *namespace,
+			Scope:      *scopeFlag,
+			PacOnly:    *pacOnly,
+			Filter:     *filter,
+			SortMode:   sortModeValue,
+			Output:     outputMode,
+			View:       *viewFlag,
+		}, kubectl.ScrapeMetrics)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error: %v\n", err)
 			os.Exit(1)
@@ -1281,7 +1201,7 @@ func main() {
 		return
 	}
 
-	scopeValue, err := scopeIndex(buildScopes(buildEndpoints(*namespace)), *scopeFlag)
+	scopeValue, err := metrics.ScopeIndex(metrics.BuildScopes(metrics.BuildEndpoints(*namespace)), *scopeFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
@@ -1295,7 +1215,7 @@ func main() {
 		scopeValue,
 		sortModeValue,
 		*filter,
-		scrapeMetrics,
+		nil,
 	))
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
