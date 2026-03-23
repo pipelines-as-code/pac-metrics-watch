@@ -1167,6 +1167,12 @@ func main() {
 		*kubeconfig = os.Getenv("KUBECONFIG")
 	}
 
+	if *namespace == defaultNamespace {
+		if detected, err := kubectl.DetectNamespace(context.Background(), *kubeconfig); err == nil {
+			*namespace = detected
+		}
+	}
+
 	sortModeValue, err := metrics.NormalizeSortMode(*sortFlag)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)

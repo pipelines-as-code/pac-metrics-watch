@@ -51,6 +51,18 @@ func CheckConfigMap(ctx context.Context, kubeconfig, namespace string) (bool, er
 	return true, nil
 }
 
+var candidateNamespaces = []string{"pipelines-as-code", "openshift-pipelines"}
+
+func DetectNamespace(ctx context.Context, kubeconfig string) (string, error) {
+	for _, ns := range candidateNamespaces {
+		out, err := RunKubectl(ctx, kubeconfig, "get", "namespace", ns, "--ignore-not-found", "-o", "name")
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			return ns, nil
+		}
+	}
+	return "", fmt.Errorf("could not detect PAC namespace: tried %v", candidateNamespaces)
+}
+
 func isNotFoundError(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "not found") || strings.Contains(msg, "notfound")
