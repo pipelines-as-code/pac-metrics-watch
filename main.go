@@ -25,6 +25,7 @@ const (
 	defaultInterval      = 5 * time.Second
 	defaultSnapshotMode  = "table"
 	minimumViewportWidth = 96
+	snapshotTimeout      = 15 * time.Second
 )
 
 // Message types for async operations.
@@ -355,6 +356,13 @@ func (m *model) ensureCursorVisible() {
 	}
 }
 
+func (m *model) switchView(mode metrics.ViewMode) {
+	m.viewMode = mode
+	m.cursor = 0
+	m.visibleStart = 0
+	m.showLabels = false
+}
+
 func (m *model) handleFilterKey(msg tea.KeyPressMsg) {
 	switch msg.String() {
 	case "esc":
@@ -495,15 +503,19 @@ func collectHealthChecks(ctx context.Context, kubeconfig, namespace string, endp
 		}
 	}
 
-	crdExists, _ := kubectl.CheckRepositoryCRD(ctx, kubeconfig)
-	if crdExists {
+	crdExists, crdErr := kubectl.CheckRepositoryCRD(ctx, kubeconfig)
+	if crdErr != nil {
+		checks = append(checks, views.HealthCheck{Name: "Repository CRD", Status: "fail", Detail: crdErr.Error()})
+	} else if crdExists {
 		checks = append(checks, views.HealthCheck{Name: "Repository CRD", Status: "pass", Detail: "registered"})
 	} else {
 		checks = append(checks, views.HealthCheck{Name: "Repository CRD", Status: "fail", Detail: "not found"})
 	}
 
-	cmExists, _ := kubectl.CheckConfigMap(ctx, kubeconfig, namespace)
-	if cmExists {
+	cmExists, cmErr := kubectl.CheckConfigMap(ctx, kubeconfig, namespace)
+	if cmErr != nil {
+		checks = append(checks, views.HealthCheck{Name: "ConfigMap: pipelines-as-code", Status: "fail", Detail: cmErr.Error()})
+	} else if cmExists {
 		checks = append(checks, views.HealthCheck{Name: "ConfigMap: pipelines-as-code", Status: "pass", Detail: "exists"})
 	} else {
 		checks = append(checks, views.HealthCheck{Name: "ConfigMap: pipelines-as-code", Status: "warn", Detail: "not found in " + namespace})
@@ -519,7 +531,7 @@ func (m *model) runHealthChecks() tea.Cmd {
 	scope := m.currentScope()
 
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
 		defer cancel()
 		return healthCheckResultMsg{checks: collectHealthChecks(ctx, kubeconfig, namespace, endpoints, scope)}
 	}
@@ -528,7 +540,7 @@ func (m *model) runHealthChecks() tea.Cmd {
 func (m *model) fetchRepoStatuses() tea.Cmd {
 	kubeconfig := m.kubeconfig
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
 		defer cancel()
 		repos, err := kubectl.GetRepositoryStatuses(ctx, kubeconfig)
 		if err != nil {
@@ -542,7 +554,7 @@ func (m *model) fetchEvents() tea.Cmd {
 	kubeconfig := m.kubeconfig
 	namespace := m.namespace
 	return func() tea.Msg {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
 		defer cancel()
 		events, err := kubectl.GetPACEvents(ctx, kubeconfig, namespace)
 		if err != nil {
@@ -640,33 +652,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			m.recomputeRows()
 		case "d":
-			m.viewMode = metrics.ViewDashboard
-			m.cursor = 0
-			m.visibleStart = 0
-			m.showLabels = false
+			m.switchView(metrics.ViewDashboard)
 		case "r":
-			m.viewMode = metrics.ViewRaw
-			m.cursor = 0
-			m.visibleStart = 0
-			m.showLabels = false
+			m.switchView(metrics.ViewRaw)
 			m.recomputeRows()
 		case "h":
-			m.viewMode = metrics.ViewHealth
-			m.cursor = 0
-			m.visibleStart = 0
-			m.showLabels = false
+			m.switchView(metrics.ViewHealth)
 			return fetchViewIfNeeded(m, metrics.ViewHealth)
 		case "p":
-			m.viewMode = metrics.ViewRepos
-			m.cursor = 0
-			m.visibleStart = 0
-			m.showLabels = false
+			m.switchView(metrics.ViewRepos)
 			return fetchViewIfNeeded(m, metrics.ViewRepos)
 		case "e":
-			m.viewMode = metrics.ViewEvents
-			m.cursor = 0
-			m.visibleStart = 0
-			m.showLabels = false
+			m.switchView(metrics.ViewEvents)
 			return fetchViewIfNeeded(m, metrics.ViewEvents)
 		case "enter":
 			if m.viewMode == metrics.ViewDashboard {
@@ -1070,14 +1067,14 @@ func runSnapshot(config metrics.SnapshotConfig, scraper metrics.ScrapeFunc) (str
 }
 
 func runHealthSnapshot(config metrics.SnapshotConfig, endpoints []metrics.EndpointDef, scope metrics.ScopeDef) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
 	defer cancel()
 	checks := collectHealthChecks(ctx, config.Kubeconfig, config.Namespace, endpoints, scope)
 	return views.RenderHealthSnapshot(checks), nil
 }
 
 func runReposSnapshot(config metrics.SnapshotConfig) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
 	defer cancel()
 
 	repos, err := kubectl.GetRepositoryStatuses(ctx, config.Kubeconfig)
@@ -1089,7 +1086,7 @@ func runReposSnapshot(config metrics.SnapshotConfig) (string, error) {
 }
 
 func runEventsSnapshot(config metrics.SnapshotConfig) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
 	defer cancel()
 
 	events, err := kubectl.GetPACEvents(ctx, config.Kubeconfig, config.Namespace)

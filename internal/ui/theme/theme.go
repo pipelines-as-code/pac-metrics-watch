@@ -22,12 +22,9 @@ var (
 	StyleTabInactive = lipgloss.NewStyle().Foreground(lipgloss.Color("#5C6370")).Padding(0, 2)
 	StyleChartPane   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#C678DD")).Padding(0, 1)
 	StyleChartTitle  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#E5C07B")).PaddingBottom(1)
-	StyleTable       = lipgloss.NewStyle().MarginTop(1)
-	StyleTableRow    = lipgloss.NewStyle()
 	StyleTableCursor = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#ABB2BF")).Background(lipgloss.Color("#2C313A"))
 	StyleTableHeader = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#ABB2BF")).Border(lipgloss.NormalBorder(), false, false, true, false).BorderForeground(lipgloss.Color("#3E4451")).PaddingBottom(1)
 
-	// New styles
 	StyleAxisLabel = lipgloss.NewStyle().Foreground(lipgloss.Color("#5C6370"))
 	StyleMinMax    = lipgloss.NewStyle().Foreground(lipgloss.Color("#5C6370"))
 	StyleBarFill   = lipgloss.NewStyle().Foreground(lipgloss.Color("#61AFEF"))
@@ -39,5 +36,4 @@ var (
 	StyleCardGreen = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#98C379")).Padding(0, 1)
 	StyleCardRed   = lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(lipgloss.Color("#E06C75")).Padding(0, 1)
 	StyleSparkDim  = lipgloss.NewStyle().Foreground(lipgloss.Color("#3E4451"))
-	StyleWarn      = lipgloss.NewStyle().Foreground(lipgloss.Color("#E5C07B"))
 )

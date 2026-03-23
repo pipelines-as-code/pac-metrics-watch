@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -27,7 +28,10 @@ func CheckRepositoryCRD(ctx context.Context, kubeconfig string) (bool, error) {
 		"--no-headers",
 	)
 	if err != nil {
-		return false, nil
+		if isNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	return true, nil
 }
@@ -39,9 +43,17 @@ func CheckConfigMap(ctx context.Context, kubeconfig, namespace string) (bool, er
 		"--no-headers",
 	)
 	if err != nil {
-		return false, nil
+		if isNotFoundError(err) {
+			return false, nil
+		}
+		return false, err
 	}
 	return true, nil
+}
+
+func isNotFoundError(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") || strings.Contains(msg, "notfound")
 }
 
 func GetRepositoryStatuses(ctx context.Context, kubeconfig string) ([]RepositoryStatus, error) {
