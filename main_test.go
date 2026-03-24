@@ -9,6 +9,7 @@ import (
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/metrics"
+	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/ui/views"
 )
 
 func mustModel(t *testing.T, m tea.Model) *model {
@@ -145,6 +146,31 @@ func TestParseMetricsScannerError(t *testing.T) {
 	line := strings.Repeat("a", 70*1024) + " 1\n"
 	if _, err := metrics.ParseMetrics(line); err == nil {
 		t.Fatal("ParseMetrics returned nil error for oversized token")
+	}
+}
+
+func TestMergeEndpointMetricsPrefixesRuntimeCollectors(t *testing.T) {
+	merged := map[string]float64{}
+	mergeEndpointMetrics(merged, "watcher", map[string]float64{
+		"go_goroutines":                 17,
+		"process_resident_memory_bytes": 4096,
+		"workqueue_depth":               3,
+	})
+
+	if got := merged["pac_watcher_go_goroutines"]; got != 17 {
+		t.Fatalf("pac_watcher_go_goroutines = %v, want 17", got)
+	}
+	if got := merged["pac_watcher_process_resident_memory_bytes"]; got != 4096 {
+		t.Fatalf("pac_watcher_process_resident_memory_bytes = %v, want 4096", got)
+	}
+	if got := merged["workqueue_depth"]; got != 3 {
+		t.Fatalf("workqueue_depth = %v, want 3", got)
+	}
+	if _, ok := merged["go_goroutines"]; ok {
+		t.Fatal("go_goroutines should be endpoint-scoped")
+	}
+	if _, ok := merged["process_resident_memory_bytes"]; ok {
+		t.Fatal("process_resident_memory_bytes should be endpoint-scoped")
 	}
 }
 
@@ -374,6 +400,90 @@ func TestEventsViewSwitch(t *testing.T) {
 	}
 	if cmd == nil {
 		t.Fatal("switching to events view should trigger fetch")
+	}
+}
+
+func TestResourcesViewSwitch(t *testing.T) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
+	nextModel, cmd := m.Update(tea.KeyPressMsg{Code: -1, Text: "m"})
+	updated := mustModel(t, nextModel)
+	if updated.viewMode != metrics.ViewResources {
+		t.Fatalf("viewMode = %q, want resources", updated.viewMode)
+	}
+	if cmd != nil {
+		t.Fatal("switching to resources view should not trigger a side fetch")
+	}
+}
+
+func TestResourcesFocusCyclesWithS(t *testing.T) {
+	m := initialModel("", defaultNamespace, time.Second, false, 0, metrics.SortByDelta, "", nil)
+	m.viewMode = metrics.ViewResources
+
+	nextModel, _ := m.Update(tea.KeyPressMsg{Code: -1, Text: "s"})
+	updated := mustModel(t, nextModel)
+	if updated.resourceFocus != views.ResourceFocusRuntime {
+		t.Fatalf("resourceFocus = %q, want runtime", updated.resourceFocus)
+	}
+
+	nextModel, _ = updated.Update(tea.KeyPressMsg{Code: -1, Text: "s"})
+	updated = mustModel(t, nextModel)
+	if updated.resourceFocus != views.ResourceFocusQueue {
+		t.Fatalf("resourceFocus = %q, want queue", updated.resourceFocus)
+	}
+}
+
+func TestRenderWithFooterPadsToBottom(t *testing.T) {
+	got := renderWithFooter([]string{"header", "content"}, "footer", 6)
+	lines := strings.Split(got, "\n")
+	if len(lines) != 6 {
+		t.Fatalf("len(lines) = %d, want 6", len(lines))
+	}
+	if lines[len(lines)-1] != "footer" {
+		t.Fatalf("last line = %q, want footer", lines[len(lines)-1])
+	}
+}
+
+func TestBuildResourceSectionUsesEndpointScopedRuntimeMetrics(t *testing.T) {
+	section := buildResourceSection(
+		"watcher",
+		views.ResourceFocusMemory,
+		map[string][]float64{
+			"pac_watcher_process_resident_memory_bytes": {100, 160},
+			"pac_watcher_go_memstats_heap_inuse_bytes":  {80, 120},
+			"pac_watcher_go_memstats_alloc_bytes":       {60, 90},
+			"pac_watcher_go_goroutines":                 {11, 14},
+		},
+		map[string]float64{
+			"pac_watcher_process_resident_memory_bytes": 60,
+			"pac_watcher_go_memstats_heap_inuse_bytes":  40,
+			"pac_watcher_go_memstats_alloc_bytes":       30,
+			"pac_watcher_go_goroutines":                 3,
+		},
+		map[string][]float64{},
+		map[string]float64{},
+		nil,
+	)
+
+	if section.PrimaryTitle != "Watcher Process RSS" {
+		t.Fatalf("PrimaryTitle = %q, want Watcher Process RSS", section.PrimaryTitle)
+	}
+
+	stats := map[string]views.ResourceStat{}
+	for _, stat := range section.Stats {
+		stats[stat.Label] = stat
+	}
+
+	for _, label := range []string{"RSS", "Heap In Use", "Alloc", "Goroutines"} {
+		stat, ok := stats[label]
+		if !ok {
+			t.Fatalf("missing stat %q", label)
+		}
+		if !stat.Available {
+			t.Fatalf("stat %q should be available", label)
+		}
+		if stat.Value == "" || stat.Value == "n/a" {
+			t.Fatalf("stat %q value = %q, want populated value", label, stat.Value)
+		}
 	}
 }
 

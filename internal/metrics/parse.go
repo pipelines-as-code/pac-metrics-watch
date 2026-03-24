@@ -132,6 +132,9 @@ func splitLabels(s string) []string {
 }
 
 func InterestingMetric(name string) bool {
+	if RuntimeCollectorMetric(name) {
+		return true
+	}
 	for _, prefix := range []string{
 		"pac_",
 		"workqueue_",
@@ -141,6 +144,15 @@ func InterestingMetric(name string) bool {
 		"tekton_",
 		"grpc_",
 	} {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func RuntimeCollectorMetric(name string) bool {
+	for _, prefix := range []string{"go_", "process_"} {
 		if strings.HasPrefix(name, prefix) {
 			return true
 		}

@@ -6,12 +6,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"text/tabwriter"
 	"time"
 	"unicode/utf8"
 
 	tea "charm.land/bubbletea/v2"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/kubectl"
 	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/metrics"
 	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/ui/components"
@@ -30,12 +32,15 @@ const (
 
 // Message types for async operations.
 type scrapeCycleResultMsg struct {
-	id       int
-	scope    int
-	metrics  map[string]float64
-	rawData  map[string]string // endpoint name -> raw metrics text
-	err      error
-	duration time.Duration
+	id              int
+	scope           int
+	metrics         map[string]float64
+	rawData         map[string]string // endpoint name -> raw metrics text
+	resourceMetrics map[string]float64
+	containerUsages []kubectl.ContainerUsage
+	err             error
+	resourceErr     string
+	duration        time.Duration
 }
 
 type tickMsg time.Time
@@ -63,29 +68,36 @@ type model struct {
 	scopes     []metrics.ScopeDef
 	scraper    metrics.ScrapeFunc
 
-	activeScope  int
-	history      map[string][]float64
-	delta        map[string]float64
-	keys         []string
-	cursor       int
-	visibleStart int
-	lastUpdate   time.Time
-	lastDuration time.Duration
-	err          string
-	width        int
-	height       int
-	scraping     bool
-	scrapeSeq    int
-	cancelScrape context.CancelFunc
-	sortMode     metrics.SortMode
-	filter       string
-	filterInput  string
-	filterMode   bool
-	viewMode     metrics.ViewMode
+	activeScope   int
+	history       map[string][]float64
+	delta         map[string]float64
+	keys          []string
+	cursor        int
+	visibleStart  int
+	lastUpdate    time.Time
+	lastDuration  time.Duration
+	err           string
+	width         int
+	height        int
+	scraping      bool
+	scrapeSeq     int
+	cancelScrape  context.CancelFunc
+	sortMode      metrics.SortMode
+	filter        string
+	filterInput   string
+	filterMode    bool
+	viewMode      metrics.ViewMode
+	resourceFocus views.ResourceFocus
 
 	// Label breakdown state
 	labeledSnapshot map[string]*metrics.MetricFamily
 	showLabels      bool
+
+	// Component resource state
+	resourceHistory map[string][]float64
+	resourceDelta   map[string]float64
+	containerUsages []kubectl.ContainerUsage
+	resourceWarning string
 
 	// Health check state
 	healthChecks  []views.HealthCheck
@@ -106,20 +118,23 @@ func initialModel(kubeconfig, namespace string, interval time.Duration, pacOnly 
 	endpoints := metrics.BuildEndpoints(namespace)
 
 	return &model{
-		kubeconfig:  kubeconfig,
-		namespace:   namespace,
-		interval:    interval,
-		pacOnly:     pacOnly,
-		endpoints:   endpoints,
-		scopes:      metrics.BuildScopes(endpoints),
-		scraper:     scraper,
-		activeScope: initialScope,
-		history:     map[string][]float64{},
-		delta:       map[string]float64{},
-		sortMode:    mode,
-		filter:      filter,
-		filterInput: filter,
-		viewMode:    metrics.ViewDashboard,
+		kubeconfig:      kubeconfig,
+		namespace:       namespace,
+		interval:        interval,
+		pacOnly:         pacOnly,
+		endpoints:       endpoints,
+		scopes:          metrics.BuildScopes(endpoints),
+		scraper:         scraper,
+		activeScope:     initialScope,
+		history:         map[string][]float64{},
+		delta:           map[string]float64{},
+		resourceHistory: map[string][]float64{},
+		resourceDelta:   map[string]float64{},
+		sortMode:        mode,
+		filter:          filter,
+		filterInput:     filter,
+		viewMode:        metrics.ViewDashboard,
+		resourceFocus:   views.ResourceFocusMemory,
 	}
 }
 
@@ -139,6 +154,10 @@ func (m *model) resetMetrics() {
 	m.lastDuration = 0
 	m.err = ""
 	m.labeledSnapshot = nil
+	m.resourceHistory = map[string][]float64{}
+	m.resourceDelta = map[string]float64{}
+	m.containerUsages = nil
+	m.resourceWarning = ""
 }
 
 func (m *model) recomputeRows() {
@@ -168,6 +187,7 @@ func (m *model) beginScrape() tea.Cmd {
 	m.scraping = true
 
 	kubeconfig := m.kubeconfig
+	namespace := m.namespace
 	scraper := m.scraper
 	endpointsCopy := m.endpoints
 
@@ -176,6 +196,7 @@ func (m *model) beginScrape() tea.Cmd {
 		startedAt := time.Now()
 		mergedMetrics := map[string]float64{}
 		rawData := map[string]string{}
+		resourceMetrics := map[string]float64{}
 		var scrapeErrors []string
 		for _, endpointIndex := range scope.EndpointIndexes {
 			endpoint := endpointsCopy[endpointIndex]
@@ -201,9 +222,7 @@ func (m *model) beginScrape() tea.Cmd {
 					scrapeErrors = append(scrapeErrors, fmt.Sprintf("%s: %v", endpoint.Name, parseErr))
 					continue
 				}
-				for name, value := range ms {
-					mergedMetrics[name] += value
-				}
+				mergeEndpointMetrics(mergedMetrics, endpoint.Name, ms)
 				rawData[endpoint.Name] = raw
 			} else {
 				ms, err := scraper(ctx, kubeconfig, endpoint.SvcPath)
@@ -219,9 +238,7 @@ func (m *model) beginScrape() tea.Cmd {
 					scrapeErrors = append(scrapeErrors, fmt.Sprintf("%s: %v", endpoint.Name, err))
 					continue
 				}
-				for name, value := range ms {
-					mergedMetrics[name] += value
-				}
+				mergeEndpointMetrics(mergedMetrics, endpoint.Name, ms)
 			}
 		}
 
@@ -230,13 +247,23 @@ func (m *model) beginScrape() tea.Cmd {
 			scrapeErr = errors.New(strings.Join(scrapeErrors, " | "))
 		}
 
+		containerUsages, resourceErr := kubectl.GetPACContainerUsages(ctx, kubeconfig, namespace)
+		if resourceErr == nil {
+			for name, value := range aggregateContainerUsages(containerUsages) {
+				resourceMetrics[name] = value
+			}
+		}
+
 		return scrapeCycleResultMsg{
-			id:       id,
-			scope:    scopeIndex,
-			metrics:  mergedMetrics,
-			rawData:  rawData,
-			err:      scrapeErr,
-			duration: time.Since(startedAt),
+			id:              id,
+			scope:           scopeIndex,
+			metrics:         mergedMetrics,
+			rawData:         rawData,
+			resourceMetrics: resourceMetrics,
+			containerUsages: containerUsages,
+			err:             scrapeErr,
+			resourceErr:     errorString(resourceErr),
+			duration:        time.Since(startedAt),
 		}
 	}
 }
@@ -298,6 +325,35 @@ func (m *model) applyMetrics(msg scrapeCycleResultMsg) {
 	m.recomputeRows()
 }
 
+func (m *model) applyResourceMetrics(samples map[string]float64, usages []kubectl.ContainerUsage) {
+	seen := make(map[string]struct{}, len(samples))
+	for name, value := range samples {
+		prev := 0.0
+		if hist := m.resourceHistory[name]; len(hist) > 0 {
+			prev = hist[len(hist)-1]
+		}
+
+		hist := append(m.resourceHistory[name], value)
+		if len(hist) > historySize {
+			hist = hist[len(hist)-historySize:]
+		}
+
+		m.resourceHistory[name] = hist
+		m.resourceDelta[name] = value - prev
+		seen[name] = struct{}{}
+	}
+
+	for name := range m.resourceHistory {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		delete(m.resourceHistory, name)
+		delete(m.resourceDelta, name)
+	}
+
+	m.containerUsages = usages
+}
+
 func (m *model) maxVisibleRows() int {
 	maxRows := m.height - 14
 	if maxRows < 1 {
@@ -314,6 +370,8 @@ func (m *model) activeLen() int {
 		return len(m.repoStatuses)
 	case metrics.ViewEvents:
 		return len(m.events)
+	case metrics.ViewResources:
+		return 0
 	default:
 		return len(m.keys)
 	}
@@ -590,6 +648,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.scraping = false
 		m.cancelScrape = nil
 		m.lastDuration = msg.duration
+		m.resourceWarning = msg.resourceErr
 
 		if msg.err != nil && errors.Is(msg.err, context.Canceled) {
 			return m, nil
@@ -599,9 +658,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.err = ""
 		}
-		if len(msg.metrics) > 0 {
+		if len(msg.metrics) > 0 || len(msg.resourceMetrics) > 0 {
 			m.lastUpdate = time.Now()
+		}
+		if len(msg.metrics) > 0 {
 			m.applyMetrics(msg)
+		}
+		if len(msg.resourceMetrics) > 0 || len(msg.containerUsages) > 0 {
+			m.applyResourceMetrics(msg.resourceMetrics, msg.containerUsages)
 		}
 		return m, doTick(m.interval)
 
@@ -645,17 +709,30 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.pacOnly = !m.pacOnly
 			m.recomputeRows()
 		case "s":
-			if m.sortMode == metrics.SortByDelta {
-				m.sortMode = metrics.SortByAlpha
+			if m.viewMode == metrics.ViewResources {
+				switch m.resourceFocus {
+				case views.ResourceFocusMemory:
+					m.resourceFocus = views.ResourceFocusRuntime
+				case views.ResourceFocusRuntime:
+					m.resourceFocus = views.ResourceFocusQueue
+				default:
+					m.resourceFocus = views.ResourceFocusMemory
+				}
 			} else {
-				m.sortMode = metrics.SortByDelta
+				if m.sortMode == metrics.SortByDelta {
+					m.sortMode = metrics.SortByAlpha
+				} else {
+					m.sortMode = metrics.SortByDelta
+				}
+				m.recomputeRows()
 			}
-			m.recomputeRows()
 		case "d":
 			m.switchView(metrics.ViewDashboard)
 		case "r":
 			m.switchView(metrics.ViewRaw)
 			m.recomputeRows()
+		case "m":
+			m.switchView(metrics.ViewResources)
 		case "h":
 			m.switchView(metrics.ViewHealth)
 			return fetchViewIfNeeded(m, metrics.ViewHealth)
@@ -697,6 +774,286 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 
 	return m, nil
+}
+
+func errorString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func aggregateContainerUsages(usages []kubectl.ContainerUsage) map[string]float64 {
+	result := map[string]float64{}
+	for _, usage := range usages {
+		result[componentResourceKey(usage.Component, "container_memory_bytes")] += float64(usage.MemoryBytes)
+		result[componentResourceKey(usage.Component, "container_cpu_millicores")] += float64(usage.CPUmilli)
+	}
+	return result
+}
+
+func componentResourceKey(component, metric string) string {
+	return "component_" + component + "_" + metric
+}
+
+func mergeEndpointMetrics(dst map[string]float64, endpoint string, samples map[string]float64) {
+	for name, value := range samples {
+		if metrics.RuntimeCollectorMetric(name) {
+			dst[componentMetricKey(endpoint, name)] = value
+			continue
+		}
+		dst[name] += value
+	}
+}
+
+func metricSnapshot(history map[string][]float64, delta map[string]float64, key string) ([]float64, float64, float64, bool, bool) {
+	hist, ok := history[key]
+	if !ok || len(hist) == 0 {
+		return nil, 0, 0, false, false
+	}
+	current := hist[len(hist)-1]
+	valueDelta, deltaOK := delta[key]
+	return hist, current, valueDelta, true, deltaOK
+}
+
+func componentMetricKey(component, canonical string) string {
+	return "pac_" + component + "_" + canonical
+}
+
+func metricStat(label, value string, available bool, deltaValue float64, deltaOK bool, formatter func(float64) string) views.ResourceStat {
+	stat := views.ResourceStat{Label: label, Available: available}
+	if !available {
+		return stat
+	}
+	stat.Value = value
+	if deltaOK {
+		stat.Delta = formatter(deltaValue)
+	} else {
+		stat.Delta = "n/a"
+	}
+	return stat
+}
+
+func buildResourceSections(scope metrics.ScopeDef, focus views.ResourceFocus, metricHistory map[string][]float64, metricDelta map[string]float64, resourceHistory map[string][]float64, resourceDelta map[string]float64, containerUsages []kubectl.ContainerUsage) []views.ComponentResources {
+	var componentsList []string
+	switch scope.Name {
+	case "controller":
+		componentsList = []string{"controller"}
+	case "watcher":
+		componentsList = []string{"watcher"}
+	default:
+		componentsList = []string{"controller", "watcher"}
+	}
+
+	var sections []views.ComponentResources
+	for _, component := range componentsList {
+		section := buildResourceSection(component, focus, metricHistory, metricDelta, resourceHistory, resourceDelta, containerUsages)
+		if section.PrimaryTitle == "" && len(section.Stats) == 0 {
+			continue
+		}
+		sections = append(sections, section)
+	}
+	return sections
+}
+
+func buildResourceSection(component string, focus views.ResourceFocus, metricHistory map[string][]float64, metricDelta map[string]float64, resourceHistory map[string][]float64, resourceDelta map[string]float64, containerUsages []kubectl.ContainerUsage) views.ComponentResources {
+	titlePrefix := strings.ToUpper(component[:1]) + component[1:]
+
+	containerMemKey := componentResourceKey(component, "container_memory_bytes")
+	containerCPUKey := componentResourceKey(component, "container_cpu_millicores")
+	rssKey := componentMetricKey(component, "process_resident_memory_bytes")
+	virtualMemKey := componentMetricKey(component, "process_virtual_memory_bytes")
+	heapKey := componentMetricKey(component, "go_memstats_heap_inuse_bytes")
+	allocKey := componentMetricKey(component, "go_memstats_alloc_bytes")
+	goroutinesKey := componentMetricKey(component, "go_goroutines")
+	gcPauseKey := componentMetricKey(component, "go_gc_duration_seconds_sum")
+	openFDsKey := componentMetricKey(component, "process_open_fds")
+	maxFDsKey := componentMetricKey(component, "process_max_fds")
+	queueDepthKey := componentMetricKey(component, "workqueue_depth")
+	unfinishedKey := componentMetricKey(component, "workqueue_unfinished_work_seconds")
+	longestKey := componentMetricKey(component, "workqueue_longest_running_processor_seconds")
+	retriesKey := componentMetricKey(component, "workqueue_retries_total")
+	activeWorkersKey := componentMetricKey(component, "controller_runtime_active_workers")
+	reconcileErrorsKey := componentMetricKey(component, "controller_runtime_reconcile_errors_total")
+
+	primaryTitle := ""
+	primaryKind := "gauge"
+	primaryValue := "n/a"
+	primaryDelta := "n/a"
+	primaryDescription := "No data available for this component."
+	primarySources := "<none>"
+	var primaryHistory []float64
+
+	switch focus {
+	case views.ResourceFocusMemory:
+		if hist, current, deltaValue, ok, deltaOK := metricSnapshot(resourceHistory, resourceDelta, containerMemKey); ok {
+			primaryTitle = titlePrefix + " Container Memory"
+			primaryValue = metrics.FormatBytes(current)
+			if deltaOK {
+				primaryDelta = metrics.FormatBytesDelta(deltaValue)
+			}
+			primaryDescription = "Summed container memory usage from kubectl top for this PAC component."
+			primarySources = "kubectl top"
+			primaryHistory = hist
+		} else if hist, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, rssKey); ok {
+			primaryTitle = titlePrefix + " Process RSS"
+			primaryValue = metrics.FormatBytes(current)
+			if deltaOK {
+				primaryDelta = metrics.FormatBytesDelta(deltaValue)
+			}
+			primaryDescription = "Resident memory reported by the Prometheus process collector on the PAC metrics endpoint."
+			primarySources = rssKey
+			primaryHistory = hist
+		}
+	case views.ResourceFocusRuntime:
+		if hist, current, deltaValue, ok, deltaOK := metricSnapshot(resourceHistory, resourceDelta, containerCPUKey); ok {
+			primaryTitle = titlePrefix + " Container CPU"
+			primaryValue = metrics.FormatMillicores(current)
+			if deltaOK {
+				primaryDelta = metrics.FormatMillicoresDelta(deltaValue)
+			}
+			primaryDescription = "Summed sampled CPU usage from kubectl top for this PAC component."
+			primarySources = "kubectl top"
+			primaryHistory = hist
+		} else if hist, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, goroutinesKey); ok {
+			primaryTitle = titlePrefix + " Goroutines"
+			primaryValue = metrics.FormatMetricNumber(current)
+			if deltaOK {
+				primaryDelta = metrics.FormatDelta(deltaValue)
+			}
+			primaryDescription = "Go runtime goroutine count exposed by the PAC metrics endpoint."
+			primarySources = goroutinesKey
+			primaryHistory = hist
+		}
+	case views.ResourceFocusQueue:
+		if hist, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, queueDepthKey); ok {
+			primaryTitle = titlePrefix + " Workqueue Depth"
+			primaryValue = metrics.FormatMetricNumber(current)
+			if deltaOK {
+				primaryDelta = metrics.FormatDelta(deltaValue)
+			}
+			primaryDescription = "Current workqueue depth for this PAC component."
+			primarySources = queueDepthKey
+			primaryHistory = hist
+		} else if hist, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, activeWorkersKey); ok {
+			primaryTitle = titlePrefix + " Active Workers"
+			primaryValue = metrics.FormatMetricNumber(current)
+			if deltaOK {
+				primaryDelta = metrics.FormatDelta(deltaValue)
+			}
+			primaryDescription = "Current active reconcile workers for this PAC component."
+			primarySources = activeWorkersKey
+			primaryHistory = hist
+		}
+	}
+
+	stats := make([]views.ResourceStat, 0, 8)
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(resourceHistory, resourceDelta, containerMemKey); ok {
+		stats = append(stats, metricStat("Container Memory", metrics.FormatBytes(current), true, deltaValue, deltaOK, metrics.FormatBytesDelta))
+	} else {
+		stats = append(stats, views.ResourceStat{Label: "Container Memory"})
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(resourceHistory, resourceDelta, containerCPUKey); ok {
+		stats = append(stats, metricStat("Container CPU", metrics.FormatMillicores(current), true, deltaValue, deltaOK, metrics.FormatMillicoresDelta))
+	} else {
+		stats = append(stats, views.ResourceStat{Label: "Container CPU"})
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, rssKey); ok {
+		stats = append(stats, metricStat("RSS", metrics.FormatBytes(current), true, deltaValue, deltaOK, metrics.FormatBytesDelta))
+	} else {
+		stats = append(stats, views.ResourceStat{Label: "RSS"})
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, heapKey); ok {
+		stats = append(stats, metricStat("Heap In Use", metrics.FormatBytes(current), true, deltaValue, deltaOK, metrics.FormatBytesDelta))
+	} else {
+		stats = append(stats, views.ResourceStat{Label: "Heap In Use"})
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, allocKey); ok {
+		stats = append(stats, metricStat("Alloc", metrics.FormatBytes(current), true, deltaValue, deltaOK, metrics.FormatBytesDelta))
+	} else {
+		stats = append(stats, views.ResourceStat{Label: "Alloc"})
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, virtualMemKey); ok {
+		stats = append(stats, metricStat("Virtual Mem", metrics.FormatBytes(current), true, deltaValue, deltaOK, metrics.FormatBytesDelta))
+	} else {
+		stats = append(stats, views.ResourceStat{Label: "Virtual Mem"})
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, goroutinesKey); ok {
+		stats = append(stats, metricStat("Goroutines", metrics.FormatMetricNumber(current), true, deltaValue, deltaOK, metrics.FormatDelta))
+	} else {
+		stats = append(stats, views.ResourceStat{Label: "Goroutines"})
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, gcPauseKey); ok {
+		stats = append(stats, metricStat("GC Pause Sum", metrics.FormatMetricNumber(current), true, deltaValue, deltaOK, metrics.FormatDelta))
+	} else {
+		stats = append(stats, views.ResourceStat{Label: "GC Pause Sum"})
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, openFDsKey); ok {
+		stats = append(stats, metricStat("Open FDs", metrics.FormatMetricNumber(current), true, deltaValue, deltaOK, metrics.FormatDelta))
+	} else {
+		stats = append(stats, views.ResourceStat{Label: "Open FDs"})
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, maxFDsKey); ok {
+		stats = append(stats, metricStat("Max FDs", metrics.FormatMetricNumber(current), true, deltaValue, deltaOK, metrics.FormatDelta))
+	} else {
+		stats = append(stats, views.ResourceStat{Label: "Max FDs"})
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, queueDepthKey); ok {
+		stats = append(stats, metricStat("Queue Depth", metrics.FormatMetricNumber(current), true, deltaValue, deltaOK, metrics.FormatDelta))
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, unfinishedKey); ok {
+		stats = append(stats, metricStat("Unfinished Work", metrics.FormatMetricNumber(current), true, deltaValue, deltaOK, metrics.FormatDelta))
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, longestKey); ok {
+		stats = append(stats, metricStat("Longest Running", metrics.FormatMetricNumber(current), true, deltaValue, deltaOK, metrics.FormatDelta))
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, retriesKey); ok {
+		stats = append(stats, metricStat("Retries", metrics.FormatMetricNumber(current), true, deltaValue, deltaOK, metrics.FormatDelta))
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, activeWorkersKey); ok {
+		stats = append(stats, metricStat("Active Workers", metrics.FormatMetricNumber(current), true, deltaValue, deltaOK, metrics.FormatDelta))
+	}
+	if _, current, deltaValue, ok, deltaOK := metricSnapshot(metricHistory, metricDelta, reconcileErrorsKey); ok {
+		stats = append(stats, metricStat("Reconcile Errors", metrics.FormatMetricNumber(current), true, deltaValue, deltaOK, metrics.FormatDelta))
+	}
+
+	filteredUsages := make([]kubectl.ContainerUsage, 0)
+	for _, usage := range containerUsages {
+		if usage.Component != component {
+			continue
+		}
+		filteredUsages = append(filteredUsages, usage)
+	}
+	sort.Slice(filteredUsages, func(i, j int) bool {
+		return filteredUsages[i].MemoryBytes > filteredUsages[j].MemoryBytes
+	})
+
+	componentContainers := make([]views.ContainerStat, 0, len(filteredUsages))
+	for _, usage := range filteredUsages {
+		componentContainers = append(componentContainers, views.ContainerStat{
+			PodName:       usage.PodName,
+			ContainerName: usage.ContainerName,
+			CPU:           metrics.FormatMillicores(float64(usage.CPUmilli)),
+			Memory:        metrics.FormatBytes(float64(usage.MemoryBytes)),
+		})
+	}
+
+	if primaryTitle == "" {
+		return views.ComponentResources{}
+	}
+
+	return views.ComponentResources{
+		Name:               titlePrefix,
+		PrimaryTitle:       primaryTitle,
+		PrimaryKind:        primaryKind,
+		PrimaryValue:       primaryValue,
+		PrimaryDelta:       primaryDelta,
+		PrimaryDescription: primaryDescription,
+		PrimarySources:     primarySources,
+		PrimaryHistory:     primaryHistory,
+		Stats:              stats,
+		Containers:         componentContainers,
+	}
 }
 
 func (m *model) renderDashboardRows(width int) ([]string, string) {
@@ -930,8 +1287,8 @@ func (m *model) View() tea.View {
 		footer := components.RenderFooter(m.err, m.filterMode, m.filterInput, width)
 		parts := []string{header, separator, summary, thinSep}
 		parts = append(parts, rows...)
-		parts = append(parts, separator, detail, "", footer)
-		view := tea.NewView(strings.Join(parts, "\n"))
+		parts = append(parts, separator, detail)
+		view := tea.NewView(renderWithFooter(parts, footer, m.height))
 		view.AltScreen = true
 		return view
 
@@ -941,16 +1298,29 @@ func (m *model) View() tea.View {
 		footer := components.RenderFooter(m.err, m.filterMode, m.filterInput, width)
 		parts := []string{header, separator, summary, thinSep}
 		parts = append(parts, rows...)
-		parts = append(parts, separator, detail, "", footer)
-		view := tea.NewView(strings.Join(parts, "\n"))
+		parts = append(parts, separator, detail)
+		view := tea.NewView(renderWithFooter(parts, footer, m.height))
+		view.AltScreen = true
+		return view
+
+	case metrics.ViewResources:
+		content := views.RenderResourcesView(
+			m.resourceFocus,
+			buildResourceSections(m.currentScope(), m.resourceFocus, m.history, m.delta, m.resourceHistory, m.resourceDelta, m.containerUsages),
+			m.resourceWarning,
+			width,
+		)
+		footer := components.RenderFooter(m.err, false, "", width)
+		parts := []string{header, separator, content}
+		view := tea.NewView(renderWithFooter(parts, footer, m.height))
 		view.AltScreen = true
 		return view
 
 	case metrics.ViewHealth:
 		healthContent := views.RenderHealthView(m.healthChecks, m.healthLoading, width)
 		footer := components.RenderFooter(m.err, false, "", width)
-		parts := []string{header, separator, healthContent, "", footer}
-		view := tea.NewView(strings.Join(parts, "\n"))
+		parts := []string{header, separator, healthContent}
+		view := tea.NewView(renderWithFooter(parts, footer, m.height))
 		view.AltScreen = true
 		return view
 
@@ -962,8 +1332,7 @@ func (m *model) View() tea.View {
 		if detail != "" {
 			parts = append(parts, separator, detail)
 		}
-		parts = append(parts, "", footer)
-		view := tea.NewView(strings.Join(parts, "\n"))
+		view := tea.NewView(renderWithFooter(parts, footer, m.height))
 		view.AltScreen = true
 		return view
 
@@ -975,8 +1344,7 @@ func (m *model) View() tea.View {
 		if detail != "" {
 			parts = append(parts, separator, detail)
 		}
-		parts = append(parts, "", footer)
-		view := tea.NewView(strings.Join(parts, "\n"))
+		view := tea.NewView(renderWithFooter(parts, footer, m.height))
 		view.AltScreen = true
 		return view
 	}
@@ -985,6 +1353,20 @@ func (m *model) View() tea.View {
 	view := tea.NewView(header)
 	view.AltScreen = true
 	return view
+}
+
+func renderWithFooter(parts []string, footer string, height int) string {
+	content := strings.Join(parts, "\n")
+	if height <= 0 {
+		return content + "\n\n" + footer
+	}
+
+	spacerLines := height - lipgloss.Height(content) - lipgloss.Height(footer)
+	if spacerLines < 1 {
+		spacerLines = 1
+	}
+
+	return content + "\n" + strings.Repeat("\n", spacerLines) + footer
 }
 
 func renderSnapshot(scope string, collectedAt time.Time, m map[string]float64, output string) string {
@@ -1049,6 +1431,8 @@ func runSnapshot(config metrics.SnapshotConfig, scraper metrics.ScrapeFunc) (str
 		return runEventsSnapshot(config)
 	case "raw":
 		return runRawSnapshot(config, endpoints, scope, scraper)
+	case "resources":
+		return runResourcesSnapshot(config, endpoints, scope, scraper)
 	}
 
 	m := map[string]float64{}
@@ -1113,6 +1497,35 @@ func runRawSnapshot(config metrics.SnapshotConfig, endpoints []metrics.EndpointD
 	return renderRawSnapshot(scope.Name, time.Now(), m, config), nil
 }
 
+func runResourcesSnapshot(config metrics.SnapshotConfig, endpoints []metrics.EndpointDef, scope metrics.ScopeDef, scraper metrics.ScrapeFunc) (string, error) {
+	m := map[string]float64{}
+	for _, endpointIndex := range scope.EndpointIndexes {
+		endpoint := endpoints[endpointIndex]
+		scrapedMetrics, err := scraper(context.Background(), config.Kubeconfig, endpoint.SvcPath)
+		if err != nil {
+			return "", fmt.Errorf("%s: %w", endpoint.Name, err)
+		}
+		for name, value := range scrapedMetrics {
+			m[name] += value
+		}
+	}
+
+	usages, usageErr := kubectl.GetPACContainerUsages(context.Background(), config.Kubeconfig, config.Namespace)
+	resourceCurrent := aggregateContainerUsages(usages)
+	resourceHistory := make(map[string][]float64, len(resourceCurrent))
+	for name, value := range resourceCurrent {
+		resourceHistory[name] = []float64{value}
+	}
+
+	metricHistory := make(map[string][]float64, len(m))
+	for name, value := range m {
+		metricHistory[name] = []float64{value}
+	}
+
+	sections := buildResourceSections(scope, views.ResourceFocusMemory, metricHistory, map[string]float64{}, resourceHistory, map[string]float64{}, usages)
+	return views.RenderResourcesSnapshot(scope.Name, time.Now(), views.ResourceFocusMemory, sections, errorString(usageErr), config.Output), nil
+}
+
 func renderRawSnapshot(scope string, collectedAt time.Time, m map[string]float64, config metrics.SnapshotConfig) string {
 	rows := make([]metrics.MetricRow, 0, len(m))
 	for name, value := range m {
@@ -1160,7 +1573,7 @@ func main() {
 	sortFlag := flag.String("sort", string(metrics.SortByDelta), "sort order for raw mode: delta or alpha")
 	filter := flag.String("filter", "", "substring filter for raw metric names")
 	output := flag.String("output", defaultSnapshotMode, "snapshot output format: table or tsv")
-	viewFlag := flag.String("view", "", "view for --once mode: dashboard, raw, health, repos, or events")
+	viewFlag := flag.String("view", "", "view for --once mode: dashboard, raw, resources, health, repos, or events")
 	flag.Parse()
 
 	if *kubeconfig == "" {

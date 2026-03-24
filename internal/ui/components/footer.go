@@ -12,11 +12,12 @@ func RenderFooter(err string, filterMode bool, filterInput string, width int) st
 		theme.StyleKey.Render("[tab]") + " scope" + pipe +
 		theme.StyleKey.Render("[d]") + " dashboard" + pipe +
 		theme.StyleKey.Render("[r]") + " raw" + pipe +
+		theme.StyleKey.Render("[m]") + " resources" + pipe +
 		theme.StyleKey.Render("[h]") + " health" + pipe +
 		theme.StyleKey.Render("[p]") + " repos" + pipe +
 		theme.StyleKey.Render("[e]") + " events" + pipe +
 		theme.StyleKey.Render("[f]") + " pac-only" + pipe +
-		theme.StyleKey.Render("[s]") + " sort" + pipe +
+		theme.StyleKey.Render("[s]") + " sort/focus" + pipe +
 		theme.StyleKey.Render("[/]") + " filter" + pipe +
 		theme.StyleKey.Render("[enter]") + " labels" + pipe +
 		theme.StyleKey.Render("[↑↓/jk]") + " scroll"

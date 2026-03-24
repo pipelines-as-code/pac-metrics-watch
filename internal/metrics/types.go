@@ -21,6 +21,7 @@ const (
 	ViewHealth    ViewMode = "health"
 	ViewRepos     ViewMode = "repos"
 	ViewEvents    ViewMode = "events"
+	ViewResources ViewMode = "resources"
 )
 
 type LabeledSample struct {

@@ -3,186 +3,57 @@ package components
 import (
 	"fmt"
 	"math"
-	"strings"
 
+	"github.com/NimbleMarkets/ntcharts/v2/canvas/runes"
+	"github.com/NimbleMarkets/ntcharts/v2/linechart"
+	"github.com/NimbleMarkets/ntcharts/v2/linechart/streamlinechart"
+	ntlipgloss "charm.land/lipgloss/v2"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/openshift-pipelines/pipelines-as-code/hack/pac-metrics-watch/internal/ui/theme"
 )
 
-const chartHeight = 8
+const (
+	chartHeight   = 8
+	chartMinWidth = 24
+)
 
-// renderLineChart draws a Unicode line chart with Y-axis labels and min/max/avg annotation.
-func renderLineChart(data []float64, width int) string {
-	if len(data) < 2 {
+var (
+	chartAxisStyle  = ntlipgloss.NewStyle().Foreground(ntlipgloss.Color("#3E4451"))
+	chartLabelStyle = ntlipgloss.NewStyle().Foreground(ntlipgloss.Color("#5C6370"))
+	chartLineStyle  = ntlipgloss.NewStyle().Foreground(ntlipgloss.Color("#61AFEF"))
+	chartIncrStyle  = ntlipgloss.NewStyle().Foreground(ntlipgloss.Color("#98C379"))
+	chartDecrStyle  = ntlipgloss.NewStyle().Foreground(ntlipgloss.Color("#E06C75"))
+)
+
+func renderMetricChart(kind string, history []float64, width int) string {
+	series := history
+	seriesLabel := "samples"
+	lineStyle := chartLineStyle
+
+	if kind == "counter" {
+		series = counterSeries(history)
+		seriesLabel = "deltas"
+		if len(series) == 0 {
+			return theme.StyleDim.Render("Not enough data for chart")
+		}
+		if allZero(series) {
+			return theme.StyleDim.Render("No delta activity")
+		}
+		if series[len(series)-1] < 0 {
+			lineStyle = chartDecrStyle
+		} else {
+			lineStyle = chartIncrStyle
+		}
+	} else if len(series) < 2 {
 		return theme.StyleDim.Render("Not enough data for chart")
 	}
 
-	allZeros := true
-	for _, v := range data {
-		if v != 0 {
-			allZeros = false
-			break
-		}
-	}
-	if allZeros {
-		return theme.StyleDim.Render("All values are 0")
-	}
+	chart := newStreamlineChart(series, width, lineStyle)
+	minVal, maxVal, avgVal := chartStats(series)
+	annotation := theme.StyleMinMax.Render(fmt.Sprintf("  min=%s  max=%s  avg=%s  %s=%d",
+		formatChartNum(minVal), formatChartNum(maxVal), formatChartNum(avgVal), seriesLabel, len(series)))
 
-	minVal, maxVal := data[0], data[0]
-	sum := 0.0
-	for _, v := range data {
-		if v < minVal {
-			minVal = v
-		}
-		if v > maxVal {
-			maxVal = v
-		}
-		sum += v
-	}
-	avgVal := sum / float64(len(data))
-
-	// Y-axis label width
-	maxLabel := formatChartNum(maxVal)
-	minLabel := formatChartNum(minVal)
-	labelWidth := len(maxLabel)
-	if len(minLabel) > labelWidth {
-		labelWidth = len(minLabel)
-	}
-	labelWidth += 1 // space after label
-
-	plotWidth := width - labelWidth - 3 // 3 for "│" and margins
-	if plotWidth < 10 {
-		plotWidth = 10
-	}
-
-	// Resample data to fit plotWidth
-	samples := resample(data, plotWidth)
-
-	// Braille-style blocks: use vertical eighth blocks for smoother rendering
-	blocks := []rune{' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'}
-
-	valRange := maxVal - minVal
-	if valRange == 0 {
-		valRange = 1
-	}
-
-	var lines []string
-	for row := chartHeight - 1; row >= 0; row-- {
-		var label string
-		switch row {
-		case chartHeight - 1:
-			label = fmt.Sprintf("%*s", labelWidth, formatChartNum(maxVal))
-		case 0:
-			label = fmt.Sprintf("%*s", labelWidth, formatChartNum(minVal))
-		case chartHeight / 2:
-			midVal := minVal + valRange/2
-			label = fmt.Sprintf("%*s", labelWidth, formatChartNum(midVal))
-		default:
-			label = strings.Repeat(" ", labelWidth)
-		}
-
-		var rowChars strings.Builder
-		for _, s := range samples {
-			// How much of this row is filled?
-			normalized := (s - minVal) / valRange * float64(chartHeight)
-			level := normalized - float64(row)
-			if level <= 0 {
-				rowChars.WriteRune(' ')
-			} else if level >= 1 {
-				rowChars.WriteRune('█')
-			} else {
-				idx := int(math.Round(level * float64(len(blocks)-1)))
-				if idx >= len(blocks) {
-					idx = len(blocks) - 1
-				}
-				rowChars.WriteRune(blocks[idx])
-			}
-		}
-
-		axisChar := "│"
-		line := theme.StyleAxisLabel.Render(label) + theme.StyleDim.Render(axisChar) + theme.StyleBarFill.Render(rowChars.String())
-		lines = append(lines, line)
-	}
-
-	// Bottom axis
-	axisLine := strings.Repeat(" ", labelWidth) + "└" + strings.Repeat("─", plotWidth)
-	lines = append(lines, theme.StyleDim.Render(axisLine))
-
-	// Annotation line
-	annotation := theme.StyleMinMax.Render(fmt.Sprintf("  min=%s  max=%s  avg=%s  samples=%d",
-		formatChartNum(minVal), formatChartNum(maxVal), formatChartNum(avgVal), len(data)))
-	lines = append(lines, annotation)
-
-	return strings.Join(lines, "\n")
-}
-
-// RenderBarChart draws a horizontal bar chart for delta-based signals.
-func RenderBarChart(data []float64, width int) string {
-	if len(data) < 2 {
-		return theme.StyleDim.Render("Not enough data for chart")
-	}
-
-	// Compute deltas
-	deltas := make([]float64, len(data)-1)
-	for i := 1; i < len(data); i++ {
-		deltas[i-1] = data[i] - data[i-1]
-	}
-
-	allZeros := true
-	for _, d := range deltas {
-		if d != 0 {
-			allZeros = false
-			break
-		}
-	}
-	if allZeros {
-		return theme.StyleDim.Render("No delta activity")
-	}
-
-	maxDelta := 0.0
-	for _, d := range deltas {
-		if math.Abs(d) > maxDelta {
-			maxDelta = math.Abs(d)
-		}
-	}
-
-	labelWidth := len(formatChartNum(maxDelta)) + 1
-	barMaxWidth := width - labelWidth - 5
-	if barMaxWidth < 10 {
-		barMaxWidth = 10
-	}
-
-	// Show last chartHeight deltas
-	visible := deltas
-	if len(visible) > chartHeight {
-		visible = visible[len(visible)-chartHeight:]
-	}
-
-	var lines []string
-	for _, d := range visible {
-		barLen := 0
-		if maxDelta > 0 {
-			barLen = int(math.Round(math.Abs(d) / maxDelta * float64(barMaxWidth)))
-		}
-		if barLen < 0 {
-			barLen = 0
-		}
-
-		label := fmt.Sprintf("%*s", labelWidth, formatChartNum(d))
-		bar := strings.Repeat("█", barLen)
-
-		barStyle := theme.StyleIncr
-		if d < 0 {
-			barStyle = theme.StyleDecr
-		} else if d == 0 {
-			barStyle = theme.StyleDim
-			bar = "·"
-		}
-
-		lines = append(lines, theme.StyleAxisLabel.Render(label)+" "+barStyle.Render(bar))
-	}
-
-	return strings.Join(lines, "\n")
+	return lipgloss.JoinVertical(lipgloss.Left, chart.View(), annotation)
 }
 
 func RenderDetailPane(title, kind, value, delta, description, sources string, history []float64, width int) string {
@@ -191,31 +62,87 @@ func RenderDetailPane(title, kind, value, delta, description, sources string, hi
 
 	infoStyled := theme.StyleDetail.Render(infoLine)
 
-	var chart string
-	if kind == "counter" {
-		chart = RenderBarChart(history, width-6)
-	} else {
-		chart = renderLineChart(history, width-6)
-	}
+	chart := renderMetricChart(kind, history, width-6)
 
 	content := lipgloss.JoinVertical(lipgloss.Left, theme.StyleChartTitle.Render(title), infoStyled, "", chart)
 	return theme.StyleChartPane.Width(width - 4).Render(content)
 }
 
-func resample(data []float64, targetLen int) []float64 {
-	if len(data) <= targetLen {
-		return data
+func newStreamlineChart(series []float64, width int, lineStyle ntlipgloss.Style) streamlinechart.Model {
+	minVal, maxVal := chartRange(series)
+	chartWidth := max(chartMinWidth, width)
+	model := linechart.New(
+		chartWidth,
+		chartHeight,
+		0,
+		float64(max(len(series)-1, 1)),
+		minVal,
+		maxVal,
+		linechart.WithXYSteps(0, 2),
+		linechart.WithYLabelFormatter(func(_ int, v float64) string { return formatChartNum(v) }),
+		linechart.WithStyles(chartAxisStyle, chartLabelStyle, lineStyle),
+	)
+
+	chart := streamlinechart.New(
+		chartWidth,
+		chartHeight,
+		streamlinechart.WithLineChart(&model),
+		streamlinechart.WithStyles(runes.ArcLineStyle, lineStyle),
+	)
+	for _, value := range series {
+		chart.Push(value)
 	}
-	result := make([]float64, targetLen)
-	ratio := float64(len(data)) / float64(targetLen)
-	for i := range targetLen {
-		srcIdx := int(float64(i) * ratio)
-		if srcIdx >= len(data) {
-			srcIdx = len(data) - 1
+	chart.Draw()
+	return chart
+}
+
+func counterSeries(history []float64) []float64 {
+	if len(history) < 2 {
+		return nil
+	}
+
+	deltas := make([]float64, 0, len(history)-1)
+	for i := 1; i < len(history); i++ {
+		deltas = append(deltas, history[i]-history[i-1])
+	}
+	return deltas
+}
+
+func chartStats(data []float64) (float64, float64, float64) {
+	if len(data) == 0 {
+		return 0, 0, 0
+	}
+
+	minVal, maxVal := data[0], data[0]
+	sum := 0.0
+	for _, value := range data {
+		if value < minVal {
+			minVal = value
 		}
-		result[i] = data[srcIdx]
+		if value > maxVal {
+			maxVal = value
+		}
+		sum += value
 	}
-	return result
+	return minVal, maxVal, sum / float64(len(data))
+}
+
+func chartRange(data []float64) (float64, float64) {
+	minVal, maxVal, _ := chartStats(data)
+	if minVal == maxVal {
+		padding := math.Max(1, math.Abs(minVal)*0.2)
+		return minVal - padding, maxVal + padding
+	}
+	return minVal, maxVal
+}
+
+func allZero(data []float64) bool {
+	for _, value := range data {
+		if value != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func formatChartNum(v float64) string {

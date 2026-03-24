@@ -9,6 +9,7 @@ import (
 
 type PodStatus struct {
 	Name     string
+	Component string
 	Phase    string
 	Ready    bool
 	Restarts int
@@ -31,6 +32,7 @@ func GetPACPods(ctx context.Context, kubeconfig, namespace string) ([]PodStatus,
 			Metadata struct {
 				Name              string    `json:"name"`
 				CreationTimestamp time.Time `json:"creationTimestamp"`
+				Labels            map[string]string `json:"labels"`
 			} `json:"metadata"`
 			Status struct {
 				Phase             string `json:"phase"`
@@ -60,6 +62,7 @@ func GetPACPods(ctx context.Context, kubeconfig, namespace string) ([]PodStatus,
 
 		pods = append(pods, PodStatus{
 			Name:     item.Metadata.Name,
+			Component: item.Metadata.Labels["app.kubernetes.io/component"],
 			Phase:    item.Status.Phase,
 			Ready:    ready,
 			Restarts: restarts,

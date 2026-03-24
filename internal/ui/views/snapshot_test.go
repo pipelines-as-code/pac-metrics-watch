@@ -137,3 +137,27 @@ func TestRenderEventsSnapshotTruncatesLongMessages(t *testing.T) {
 		t.Error("output should contain ellipsis for truncated messages")
 	}
 }
+
+func TestRenderResourcesSnapshot(t *testing.T) {
+	output := RenderResourcesSnapshot("all", time.Unix(0, 0).UTC(), ResourceFocusMemory, []ComponentResources{
+		{
+			Name:         "Controller",
+			PrimaryTitle: "Controller Container Memory",
+			PrimaryValue: "64MiB",
+			PrimaryDelta: "n/a",
+			Stats: []ResourceStat{
+				{Label: "RSS", Value: "48MiB", Delta: "n/a", Available: true},
+			},
+		},
+	}, "", "table")
+
+	if !strings.Contains(output, "view:\tresources") {
+		t.Fatalf("output missing resources view metadata: %q", output)
+	}
+	if !strings.Contains(output, "Controller Container Memory") {
+		t.Fatalf("output missing primary metric title: %q", output)
+	}
+	if !strings.Contains(output, "RSS") {
+		t.Fatalf("output missing stats row: %q", output)
+	}
+}

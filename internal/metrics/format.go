@@ -61,3 +61,58 @@ func FormatDelta(value float64) string {
 	}
 	return fmt.Sprintf("%+.3f", value)
 }
+
+func FormatBytes(value float64) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Sprintf("%g", value)
+	}
+	if value == 0 {
+		return "0B"
+	}
+
+	abs := math.Abs(value)
+	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	unit := 0
+	for abs >= 1024 && unit < len(units)-1 {
+		abs /= 1024
+		unit++
+	}
+
+	scaled := value / math.Pow(1024, float64(unit))
+	if unit == 0 || math.Abs(scaled) >= 10 {
+		return fmt.Sprintf("%.0f%s", scaled, units[unit])
+	}
+	return fmt.Sprintf("%.1f%s", scaled, units[unit])
+}
+
+func FormatBytesDelta(value float64) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Sprintf("%+g", value)
+	}
+	sign := "+"
+	if value < 0 {
+		sign = "-"
+	}
+	return sign + FormatBytes(math.Abs(value))
+}
+
+func FormatMillicores(value float64) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Sprintf("%g", value)
+	}
+	if math.Abs(value) >= 1000 {
+		return fmt.Sprintf("%.2f cores", value/1000)
+	}
+	return fmt.Sprintf("%.0fm", value)
+}
+
+func FormatMillicoresDelta(value float64) string {
+	if math.IsNaN(value) || math.IsInf(value, 0) {
+		return fmt.Sprintf("%+g", value)
+	}
+	sign := "+"
+	if value < 0 {
+		sign = "-"
+	}
+	return sign + FormatMillicores(math.Abs(value))
+}

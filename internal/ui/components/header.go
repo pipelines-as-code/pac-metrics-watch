@@ -40,6 +40,7 @@ func RenderHeader(title string, scopes []string, activeScope int, viewMode strin
 	}{
 		{"Dashboard (d)", "dashboard"},
 		{"Raw (r)", "raw"},
+		{"Resources (m)", "resources"},
 		{"Health (h)", "health"},
 		{"Repos (p)", "repos"},
 		{"Events (e)", "events"},
@@ -57,7 +58,7 @@ func RenderHeader(title string, scopes []string, activeScope int, viewMode strin
 	}
 
 	topLine := theme.StyleHeader.Render(title) + "  " + strings.Join(scopeStrs, pipe)
-	tabsLine := lipgloss.JoinHorizontal(lipgloss.Bottom, tabStrs[0], pipe, tabStrs[1], pipe, tabStrs[2], pipe, tabStrs[3], pipe, tabStrs[4])
+	tabsLine := lipgloss.JoinHorizontal(lipgloss.Bottom, tabStrs[0], pipe, tabStrs[1], pipe, tabStrs[2], pipe, tabStrs[3], pipe, tabStrs[4], pipe, tabStrs[5])
 	infoLine := statusDot + " " + theme.StyleDim.Render(status) +
 		pipe + theme.StyleDim.Render("sort:"+sortMode) +
 		pipe + theme.StyleDim.Render("filter:"+filterLabel) +
